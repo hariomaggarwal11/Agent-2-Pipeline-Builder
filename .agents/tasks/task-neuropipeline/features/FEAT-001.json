@@ -2,7 +2,7 @@
   "id": "FEAT-001",
   "type": "feat",
   "description": "Project scaffolding, configuration, and core infrastructure - create the complete directory structure, requirements.txt, config.py, and all core modules (agent1_bridge, pipeline_planner, code_generator, executor, shared utilities). This establishes the non-UI backbone of the application.",
-  "status": "in_progress",
+  "status": "completed",
   "steps": [
     "Create neuropipeline/requirements.txt with all dependencies from the spec (streamlit, anthropic, jinja2, mne, wfdb, neurokit2, torch, torch-geometric, scikit-learn, scipy, numpy, pandas, h5py, plotly, matplotlib, seaborn, shap, captum, black, autopep8, reportlab, pymatreader, pyedflib, pytest)",
     "Create neuropipeline/config.py with: THEME_COLORS (extending Agent 1 with pipeline-node-bg, pipeline-node-border, pipeline-node-active, pipeline-edge-color, pipeline-done, pipeline-running, pipeline-pending, code-bg, code-border), MODEL_REGISTRY (all supported architectures: gat_tcn, eegnet, cnn1d, lstm, transformer, resnet1d, custom), TEMPLATE_REGISTRY mapping stage names to template files, EEG_STAGES and ECG_STAGES lists, DATASET_TASKS mapping, and Anthropic API config",
@@ -34,5 +34,5 @@
     "python -c \"import sys; sys.path.insert(0, 'neuropipeline'); from config import MODEL_REGISTRY, EEG_STAGES, ECG_STAGES; print(len(MODEL_REGISTRY), len(EEG_STAGES), len(ECG_STAGES))\""
   ],
   "blocked_reason": null,
-  "findings": ""
+  "findings": "All 31 Python source files created and verified syntactically valid. All verification commands pass: pipeline_planner correctly maps DREAMER->gat_tcn/emotion_recognition, PhysioNet MI->eegnet/motor_imagery, ECG>=12 leads->resnet1d, ECG<12->cnn1d_lstm. ICA enabled when quality>=70 and n_ch>=8. FAA included for emotion_recognition. Python 3.11.15 available via pyenv global. No dependencies installed yet (as instructed)."
 }
