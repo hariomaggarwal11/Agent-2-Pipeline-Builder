@@ -2,7 +2,7 @@
   "id": "FEAT-003",
   "type": "feat",
   "description": "Complete Streamlit UI - landing page, pipeline canvas, stage configurator, code viewer, executor panel, results dashboard, components library, and CSS styling. This creates the full interactive interface.",
-  "status": "pending",
+  "status": "in_progress",
   "steps": [
     "Create neuropipeline/ui/__init__.py",
     "Create neuropipeline/ui/styles.py - extend Agent 1 dark theme with new CSS variables (pipeline-node-bg: #141e30, pipeline-node-border: #1e3a5f, pipeline-node-active: #00d4ff22, pipeline-edge-color: #2563eb, pipeline-done: #22c55e, pipeline-running: #f59e0b, pipeline-pending: #334155, code-bg: #0d1117, code-border: #21262d, font-code: JetBrains Mono). Import Space Grotesk for headers. Include all Agent 1 base styles plus pipeline-specific node cards, code preview panels, status indicators",
