@@ -1,7 +1,17 @@
 """NeuroPipeline - Streamlit application entry point.
 
-Run with: streamlit run neuropipeline/app.py
+Run with:
+  streamlit run app.py          (from inside neuropipeline/)
+  streamlit run neuropipeline/app.py  (from parent directory)
 """
+
+import sys
+from pathlib import Path
+
+# Ensure the neuropipeline package is importable regardless of working directory
+_project_root = Path(__file__).resolve().parent.parent
+if str(_project_root) not in sys.path:
+    sys.path.insert(0, str(_project_root))
 
 import streamlit as st
 

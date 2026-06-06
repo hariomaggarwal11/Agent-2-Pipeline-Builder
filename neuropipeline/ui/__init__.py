@@ -1,7 +1,7 @@
 """NeuroPipeline UI components and pages."""
 
-from neuropipeline.ui.styles import get_custom_css
-from neuropipeline.ui.components import (
+from neuropipeline.ui.styles import get_custom_css  # noqa: E402
+from neuropipeline.ui.components import (  # noqa: E402
     pipeline_node_card,
     status_badge,
     code_block,
