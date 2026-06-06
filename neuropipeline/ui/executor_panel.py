@@ -72,9 +72,12 @@ def _execute_stage(stage_name, code_string):
             tmp_file.write(code_string)
             tmp_path = tmp_file.name
 
-        # Execute with subprocess
+        # Execute with subprocess - use sys.executable to ensure
+        # the same Python (with installed packages) is used
+        import sys
+
         process = subprocess.Popen(
-            ["python", tmp_path],
+            [sys.executable, tmp_path],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,

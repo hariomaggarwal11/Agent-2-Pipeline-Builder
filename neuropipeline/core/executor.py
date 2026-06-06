@@ -103,7 +103,7 @@ class PipelineExecutor:
 
         try:
             process = subprocess.Popen(
-                ["python", script_path],
+                [sys.executable, script_path],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,

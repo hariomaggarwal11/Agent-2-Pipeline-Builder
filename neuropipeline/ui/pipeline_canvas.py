@@ -162,6 +162,7 @@ def _execute_stage_inline(stage_key, code):
     Returns True if successful, False otherwise.
     """
     import subprocess
+    import sys
     import tempfile
     import os
     import time
@@ -178,7 +179,7 @@ def _execute_stage_inline(stage_key, code):
             tmp_path = tmp_file.name
 
         process = subprocess.Popen(
-            ["python", tmp_path],
+            [sys.executable, tmp_path],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
