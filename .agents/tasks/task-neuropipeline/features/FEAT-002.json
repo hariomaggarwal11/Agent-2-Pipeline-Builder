@@ -2,7 +2,7 @@
   "id": "FEAT-002",
   "type": "feat",
   "description": "Jinja2 code templates for all EEG and ECG pipeline stages - create the .py.j2 template files that generate runnable Python code when rendered with stage-specific configuration variables.",
-  "status": "pending",
+  "status": "completed",
   "steps": [
     "Create neuropipeline/templates/eeg/ directory",
     "Create neuropipeline/templates/eeg/quality_check.py.j2 - template for EEG quality check code as specified (loads Agent 1 report, loads raw EEG with MNE, checks quality gates, flat channels, line noise)",
@@ -41,5 +41,5 @@
     "python -c \"from jinja2 import Environment, FileSystemLoader; env = Environment(loader=FileSystemLoader('neuropipeline/templates/ecg')); t = env.get_template('quality_check.py.j2'); code = t.render(dataset_name='MIT-BIH', format='dat', quality_score=90, filepath='data.dat', quality_threshold=60, fail_on_clipping=True, fail_on_noise=True); compile(code, '<string>', 'exec'); print('ECG QC template OK')\""
   ],
   "blocked_reason": null,
-  "findings": ""
+  "findings": "All 22 Jinja2 templates created and verified. Each template renders to syntactically valid Python when given typical variable values. Templates include docstrings with dataset_name/modality/purpose, [STAGE] print prefixes, outputs/ directory usage, neurophysiological rationale comments with paper references, seed 42, and REVIEW comments. Verification used Jinja2 trim_blocks=True and lstrip_blocks=True for clean rendering (matching code_generator.py settings)."
 }
