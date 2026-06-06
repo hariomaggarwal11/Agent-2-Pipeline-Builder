@@ -1,0 +1,7 @@
+{
+  "task_id": "task-neuropipeline",
+  "task_description": "Build NeuroPipeline - Agent 2 of the BioMed Research Agent Suite. A Streamlit-based code-generation agent that consumes Agent 1 (NeuroInspect) JSON reports and generates complete, runnable ML pipelines for EEG/ECG datasets. Features visual pipeline builder, live code preview, one-click execution, and zip export.",
+  "status": "in_progress",
+  "feature_order": ["FEAT-001", "FEAT-002", "FEAT-003", "FEAT-004"],
+  "blocked_reason": null
+}

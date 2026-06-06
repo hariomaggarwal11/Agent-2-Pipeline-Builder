@@ -1,0 +1,29 @@
+{
+  "id": "FEAT-004",
+  "type": "feat",
+  "description": "Tests and final integration - pytest test suite covering agent1_bridge, pipeline_planner, EEG stages, ECG stages, and code_generator. Plus final integration ensuring all modules work together.",
+  "status": "pending",
+  "steps": [
+    "Create neuropipeline/tests/__init__.py",
+    "Create neuropipeline/tests/conftest.py - shared fixtures: sample_agent1_eeg_report (DREAMER-like JSON dict with modality=EEG, known_dataset.name=DREAMER, quality_score.score=85, metadata with 14 channels, 128 Hz, artifacts dict), sample_agent1_ecg_report (MIT-BIH-like JSON with modality=ECG, 2 leads, 360 Hz), sample_pipeline_config (output of plan_pipeline for DREAMER)",
+    "Create neuropipeline/tests/test_agent1_bridge.py - test load_agent1_report with valid JSON, test parsing of EEG and ECG reports, test error handling for invalid JSON",
+    "Create neuropipeline/tests/test_pipeline_planner.py - test plan_pipeline for DREAMER (expect gat_tcn model, emotion_recognition task, trial-based epochs), test for MIT-BIH ECG (expect resnet1d or cnn1d_lstm), test for Motor Imagery (expect event-based epochs), test for low-channel EEG (expect eegnet)",
+    "Create neuropipeline/tests/test_eeg_stages.py - test each EEG stage module's get_config_schema() returns dict with expected keys, test get_default_config() with DREAMER info, test generate_code() produces syntactically valid Python (using ast.parse)",
+    "Create neuropipeline/tests/test_ecg_stages.py - test each ECG stage module's get_config_schema()/get_default_config()/generate_code() same pattern as EEG tests",
+    "Create neuropipeline/tests/test_code_generator.py - test template-based code generation (mock Jinja2 rendering), test that generate_stage_code returns valid Python for each stage type, test generate_custom_model with mocked Anthropic API response",
+    "Ensure all tests pass with pytest neuropipeline/tests/ -v"
+  ],
+  "acceptance_criteria": [
+    "pytest neuropipeline/tests/ -v runs and all tests pass",
+    "test_pipeline_planner.py has at least 4 test cases covering different datasets/modalities",
+    "test_eeg_stages.py tests all 8 EEG stages",
+    "test_ecg_stages.py tests all 9 ECG stages",
+    "test_code_generator.py mocks the Anthropic API (does not make real API calls in tests)",
+    "No test requires external data files or network access"
+  ],
+  "verification": [
+    "cd /projects/sandbox/Agent-2-Pipeline-Builder && python -m pytest neuropipeline/tests/ -v --tb=short"
+  ],
+  "blocked_reason": null,
+  "findings": ""
+}

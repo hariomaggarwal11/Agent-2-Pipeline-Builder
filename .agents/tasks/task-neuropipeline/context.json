@@ -1,0 +1,23 @@
+{
+  "project_type": "Python Streamlit application - EEG/ECG ML pipeline code generation agent",
+  "language": "Python 3.11",
+  "build_system": "pip with requirements.txt",
+  "test_framework": "pytest with conftest.py fixtures",
+  "build_command": "cd /projects/sandbox/Agent-2-Pipeline-Builder && pip install -r neuropipeline/requirements.txt",
+  "test_command": "cd /projects/sandbox/Agent-2-Pipeline-Builder && python -m pytest neuropipeline/tests/ -v",
+  "verification_instructions": "1. Install requirements. 2. Run pytest. 3. Verify streamlit app imports without errors.",
+  "snapshot_or_generated_files": null,
+  "setup_instructions": "pip install -r neuropipeline/requirements.txt",
+  "environment_constraints": "OPEN_INTERNET - full access to PyPI. Python 3.11.14 via pyenv. Anthropic API key: fe_oa_04d4162e8c7e6e8a5584ee4491040b73f9895884e2ed85b3",
+  "contribution_requirements": "All code goes inside neuropipeline/ subdirectory within the repo root. Follow Agent 1 patterns for consistency.",
+  "key_patterns": "Agent 1 uses: dark scientific theme with CSS variables, MNE-Python for EEG, WFDB for ECG, report dicts with modality/metadata/quality_score/artifacts/known_dataset keys, Streamlit UI with sidebar+main panel layout, reportlab for PDF export. Agent 2 extends this with pipeline nodes, Jinja2 templates, and Anthropic Claude API for code generation.",
+  "relevant_files": [
+    "/projects/sandbox/neuroinspect/config.py",
+    "/projects/sandbox/neuroinspect/ui/styles.py",
+    "/projects/sandbox/neuroinspect/core/shared/exporter.py",
+    "/projects/sandbox/neuroinspect/core/eeg/report_builder.py",
+    "/projects/sandbox/neuroinspect/core/ecg/report_builder.py",
+    "/projects/sandbox/neuroinspect/tests/conftest.py"
+  ],
+  "directory_structure": "neuropipeline/ at repo root with: app.py (entry), config.py, core/ (agent1_bridge, pipeline_planner, code_generator, executor, eeg/stages/, ecg/stages/, shared/), ui/ (landing, pipeline_canvas, stage_configurator, code_viewer, executor_panel, results_dashboard, components, styles), templates/ (eeg/*.py.j2, ecg/*.py.j2), tests/"
+}

@@ -1,0 +1,38 @@
+{
+  "id": "FEAT-001",
+  "type": "feat",
+  "description": "Project scaffolding, configuration, and core infrastructure - create the complete directory structure, requirements.txt, config.py, and all core modules (agent1_bridge, pipeline_planner, code_generator, executor, shared utilities). This establishes the non-UI backbone of the application.",
+  "status": "in_progress",
+  "steps": [
+    "Create neuropipeline/requirements.txt with all dependencies from the spec (streamlit, anthropic, jinja2, mne, wfdb, neurokit2, torch, torch-geometric, scikit-learn, scipy, numpy, pandas, h5py, plotly, matplotlib, seaborn, shap, captum, black, autopep8, reportlab, pymatreader, pyedflib, pytest)",
+    "Create neuropipeline/config.py with: THEME_COLORS (extending Agent 1 with pipeline-node-bg, pipeline-node-border, pipeline-node-active, pipeline-edge-color, pipeline-done, pipeline-running, pipeline-pending, code-bg, code-border), MODEL_REGISTRY (all supported architectures: gat_tcn, eegnet, cnn1d, lstm, transformer, resnet1d, custom), TEMPLATE_REGISTRY mapping stage names to template files, EEG_STAGES and ECG_STAGES lists, DATASET_TASKS mapping, and Anthropic API config",
+    "Create neuropipeline/core/__init__.py",
+    "Create neuropipeline/core/agent1_bridge.py - reads Agent 1 JSON reports, parses the structured dict with modality/metadata/quality_score/artifacts/known_dataset keys. Include load_agent1_report(filepath) and optionally run_neuroinspect(dataset_path) which calls subprocess to re-run Agent 1",
+    "Create neuropipeline/core/pipeline_planner.py - the plan_pipeline(agent1_json) function that maps Agent 1 report to recommended pipeline config. Follow the exact logic from the spec: dataset detection, task mapping, model recommendation, stage parameter defaults based on modality/channels/quality",
+    "Create neuropipeline/core/code_generator.py - Anthropic Claude API integration with the SYSTEM_PROMPT from spec. Include generate_stage_code(stage_name, config, dataset_info) using Jinja2 templates, and generate_custom_model(description, dataset_info) for free-form model generation via Claude API",
+    "Create neuropipeline/core/executor.py - subprocess-based stage execution with Popen, stdout streaming, timeout handling, and status tracking (pending/running/done/failed/skipped)",
+    "Create neuropipeline/core/shared/__init__.py",
+    "Create neuropipeline/core/shared/model_registry.py - catalogue of all supported architectures with metadata (name, description, input_type, recommended_for, hyperparameters with defaults)",
+    "Create neuropipeline/core/shared/exporter.py - zip project export: bundles generated scripts, README.md, requirements.txt, run_pipeline.sh, pipeline_config.json into downloadable .zip",
+    "Create neuropipeline/core/shared/report_writer.py - pipeline run report generation (PDF using reportlab with metrics, plots summary, configuration used)",
+    "Create neuropipeline/core/eeg/__init__.py and neuropipeline/core/ecg/__init__.py",
+    "Create all EEG stage modules in neuropipeline/core/eeg/stages/ (s1_quality_check.py through s8_interpretation.py) - each module has a get_config_schema() returning available options, get_default_config(dataset_info) returning defaults, and generate_code(config) returning the rendered Python code for that stage",
+    "Create all ECG stage modules in neuropipeline/core/ecg/stages/ (s1_quality_check.py through s9_clinical_interpretation.py) - same pattern as EEG stages but with ECG-specific options (r-peak detection, beat segmentation, HRV features, clinical metrics)"
+  ],
+  "acceptance_criteria": [
+    "All Python files are syntactically valid (python -c 'import ast; ast.parse(open(f).read())' passes for each)",
+    "neuropipeline/requirements.txt contains all specified dependencies",
+    "config.py defines MODEL_REGISTRY, EEG_STAGES, ECG_STAGES, DATASET_TASKS",
+    "agent1_bridge.py can parse a sample Agent 1 JSON dict and return structured data",
+    "pipeline_planner.py plan_pipeline() returns correct config for DREAMER EEG dataset (model=gat_tcn, task=emotion_recognition)",
+    "code_generator.py has both template-based and Claude API generation paths",
+    "Each EEG/ECG stage module exports get_config_schema(), get_default_config(), and generate_code()"
+  ],
+  "verification": [
+    "python -c \"import sys; sys.path.insert(0, 'neuropipeline'); from core.pipeline_planner import plan_pipeline; print(plan_pipeline({'modality': 'EEG', 'known_dataset': {'name': 'DREAMER'}, 'quality_score': {'score': 85}, 'metadata': {'Number of Channels': 14}}))\"",
+    "python -c \"import sys; sys.path.insert(0, 'neuropipeline'); from core.agent1_bridge import load_agent1_report; print('OK')\"",
+    "python -c \"import sys; sys.path.insert(0, 'neuropipeline'); from config import MODEL_REGISTRY, EEG_STAGES, ECG_STAGES; print(len(MODEL_REGISTRY), len(EEG_STAGES), len(ECG_STAGES))\""
+  ],
+  "blocked_reason": null,
+  "findings": ""
+}

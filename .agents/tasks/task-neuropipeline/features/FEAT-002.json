@@ -1,0 +1,45 @@
+{
+  "id": "FEAT-002",
+  "type": "feat",
+  "description": "Jinja2 code templates for all EEG and ECG pipeline stages - create the .py.j2 template files that generate runnable Python code when rendered with stage-specific configuration variables.",
+  "status": "pending",
+  "steps": [
+    "Create neuropipeline/templates/eeg/ directory",
+    "Create neuropipeline/templates/eeg/quality_check.py.j2 - template for EEG quality check code as specified (loads Agent 1 report, loads raw EEG with MNE, checks quality gates, flat channels, line noise)",
+    "Create neuropipeline/templates/eeg/preprocessing.py.j2 - bandpass filter, notch filter, re-reference (CAR/linked mastoid/Laplacian), ICA artifact removal, bad channel interpolation, optional downsampling",
+    "Create neuropipeline/templates/eeg/epoching.py.j2 - event-based, fixed-length, or trial-based epoching with configurable tmin/tmax, rejection thresholds, label binarization, subject splitting for LOSO",
+    "Create neuropipeline/templates/eeg/feature_extraction.py.j2 - temporal/spectral/connectivity/combined features. Band power (Welch/Multitaper), PLV/WPLI connectivity matrices, FAA computation, combined node+edge features for GAT-TCN",
+    "Create neuropipeline/templates/eeg/feature_selection.py.j2 - mRMR, mutual information, ANOVA, RFE, or None. StandardScaler/MinMaxScaler normalization",
+    "Create neuropipeline/templates/eeg/model_gat_tcn.py.j2 - complete PyTorch + torch_geometric GAT-TCN model: GATConv layers for spatial, TCN for temporal, fusion, training loop with early stopping, class weights",
+    "Create neuropipeline/templates/eeg/model_eegnet.py.j2 - EEGNet architecture in PyTorch with configurable parameters",
+    "Create neuropipeline/templates/eeg/model_lstm.py.j2 - BiLSTM model for EEG classification",
+    "Create neuropipeline/templates/eeg/model_transformer.py.j2 - EEG Transformer (EEGFormer-style) architecture",
+    "Create neuropipeline/templates/eeg/evaluation.py.j2 - LOSO/KFold/stratified/holdout CV, metrics (accuracy, F1, AUC-ROC, precision/recall), plots (confusion matrix, ROC curve, per-subject bar chart, loss curves), permutation test",
+    "Create neuropipeline/templates/eeg/interpretation.py.j2 - GNN-Explainer, SHAP, Grad-CAM, attention visualization, FAA analysis, topomap of important channels",
+    "Create neuropipeline/templates/ecg/ directory",
+    "Create neuropipeline/templates/ecg/quality_check.py.j2 - ECG quality check using Agent 1 report",
+    "Create neuropipeline/templates/ecg/preprocessing.py.j2 - bandpass filter, baseline correction, amplitude normalization, wavelet/Savitzky-Golay denoising, lead selection, resampling",
+    "Create neuropipeline/templates/ecg/rpeak_detection.py.j2 - Pan-Tompkins, Hamilton, NeuroKit2, or matched filter R-peak detection with correction",
+    "Create neuropipeline/templates/ecg/beat_segmentation.py.j2 - R-peak centered windowing, per-beat normalization, ectopic beat filtering",
+    "Create neuropipeline/templates/ecg/feature_extraction.py.j2 - time-domain HRV, frequency-domain HRV, nonlinear HRV, morphological features",
+    "Create neuropipeline/templates/ecg/feature_selection.py.j2 - same methods as EEG but default mRMR",
+    "Create neuropipeline/templates/ecg/model_cnn1d.py.j2 - 1D CNN model for ECG classification",
+    "Create neuropipeline/templates/ecg/model_resnet.py.j2 - 1D ResNet model for arrhythmia detection",
+    "Create neuropipeline/templates/ecg/model_lstm.py.j2 - LSTM/BiLSTM for ECG",
+    "Create neuropipeline/templates/ecg/evaluation.py.j2 - evaluation with clinical metrics (sensitivity, specificity, PPV, NPV, AHA compliance)",
+    "Create neuropipeline/templates/ecg/clinical_interpretation.py.j2 - heart rate trends, rhythm classification, SNOMED-CT mapping, ICD-10 suggestions, with FOR RESEARCH ONLY disclaimers"
+  ],
+  "acceptance_criteria": [
+    "All .py.j2 templates are valid Jinja2 syntax",
+    "EEG quality_check.py.j2 renders to valid Python when given sample variables (dataset_name, format, quality_score, filepath, quality_threshold, etc.)",
+    "model_gat_tcn.py.j2 renders to valid PyTorch code with GATConv and TCN layers",
+    "ECG rpeak_detection.py.j2 renders to code using neurokit2/wfdb for R-peak detection",
+    "All templates include docstrings with dataset name, modality, stage purpose as required by the spec"
+  ],
+  "verification": [
+    "python -c \"from jinja2 import Environment, FileSystemLoader; env = Environment(loader=FileSystemLoader('neuropipeline/templates/eeg')); t = env.get_template('quality_check.py.j2'); code = t.render(dataset_name='DREAMER', format='mat', quality_score=85, filepath='data.mat', mne_reader='read_raw_edf', quality_threshold=60, fail_on_flat=True, fail_on_line_noise=True); compile(code, '<string>', 'exec'); print('EEG QC template OK')\"",
+    "python -c \"from jinja2 import Environment, FileSystemLoader; env = Environment(loader=FileSystemLoader('neuropipeline/templates/ecg')); t = env.get_template('quality_check.py.j2'); code = t.render(dataset_name='MIT-BIH', format='dat', quality_score=90, filepath='data.dat', quality_threshold=60, fail_on_clipping=True, fail_on_noise=True); compile(code, '<string>', 'exec'); print('ECG QC template OK')\""
+  ],
+  "blocked_reason": null,
+  "findings": ""
+}
