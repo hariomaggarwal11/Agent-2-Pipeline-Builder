@@ -1,0 +1,245 @@
+"""
+EEG BiLSTM Model
+=================
+Dataset: {{ dataset_name }}
+Modality: EEG
+Purpose: Bidirectional LSTM for EEG sequence classification. Captures
+         temporal dependencies in both forward and backward directions,
+         effective for time-series EEG data where context from both
+         past and future timepoints improves classification.
+
+Reference: Hochreiter & Schmidhuber (1997) - Long Short-Term Memory;
+           Schuster & Paliwal (1997) - Bidirectional Recurrent Neural Networks.
+"""
+
+import os
+import json
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+
+# Neurophysiological rationale:
+# EEG signals exhibit temporal dependencies across multiple timescales.
+# LSTM networks can learn long-range dependencies in neural time series
+# without suffering from vanishing gradients. Bidirectional processing
+# captures both anticipatory (forward) and retrospective (backward)
+# neural dynamics (Bashivan et al., 2016).
+
+SEED = 42
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
+# Configuration
+DATASET_NAME = "{{ dataset_name }}"
+INPUT_SIZE = {{ input_size }}  # Feature dimension per timestep
+HIDDEN_SIZE = {{ hidden_size }}  # LSTM hidden state dimension
+NUM_LAYERS = {{ num_layers }}  # Number of stacked LSTM layers
+N_CLASSES = {{ n_classes }}
+DROPOUT = {{ dropout }}
+BIDIRECTIONAL = {{ bidirectional }}
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+os.makedirs("outputs", exist_ok=True)
+
+
+class BiLSTMClassifier(nn.Module):
+    """Bidirectional LSTM for EEG classification.
+
+    Stacked BiLSTM layers process temporal EEG features, with the final
+    hidden states combined for classification.
+
+    Input shape: (batch_size, seq_len, input_size)
+    Output shape: (batch_size, n_classes)
+    """
+
+    def __init__(self, input_size=INPUT_SIZE, hidden_size=HIDDEN_SIZE,
+                 num_layers=NUM_LAYERS, n_classes=N_CLASSES,
+                 dropout=DROPOUT, bidirectional=BIDIRECTIONAL):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.bidirectional = bidirectional
+        self.num_directions = 2 if bidirectional else 1
+
+        self.lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0,
+            bidirectional=bidirectional,
+        )
+
+        # Attention mechanism for temporal weighting
+        self.attention = nn.Sequential(
+            nn.Linear(hidden_size * self.num_directions, hidden_size),
+            nn.Tanh(),
+            nn.Linear(hidden_size, 1),
+        )
+
+        # Classification head
+        self.classifier = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size * self.num_directions, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, n_classes),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        """Initialize LSTM and linear layer weights."""
+        for name, param in self.lstm.named_parameters():
+            if "weight" in name:
+                nn.init.orthogonal_(param)
+            elif "bias" in name:
+                nn.init.zeros_(param)
+                # Set forget gate bias to 1 (Jozefowicz et al., 2015)
+                n = param.size(0)
+                param.data[n // 4:n // 2].fill_(1.0)
+        for m in self.classifier:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        """Forward pass with attention-weighted temporal pooling.
+
+        Parameters
+        ----------
+        x : Tensor
+            Input sequences (batch, seq_len, input_size).
+
+        Returns
+        -------
+        Tensor
+            Class logits (batch, n_classes).
+        """
+        # LSTM encoding
+        lstm_out, (h_n, c_n) = self.lstm(x)
+        # lstm_out: (batch, seq_len, hidden_size * num_directions)
+
+        # Attention-weighted pooling
+        attn_weights = self.attention(lstm_out)  # (batch, seq_len, 1)
+        attn_weights = torch.softmax(attn_weights, dim=1)
+        context = torch.sum(lstm_out * attn_weights, dim=1)  # (batch, hidden_size * num_directions)
+
+        # Classification
+        output = self.classifier(context)
+        return output
+
+
+def train_lstm():
+    """Train the BiLSTM model."""
+    print(f"[MODEL_LSTM] Starting BiLSTM training for: {DATASET_NAME}")
+    print(f"[MODEL_LSTM] Config: hidden={HIDDEN_SIZE}, layers={NUM_LAYERS}, bidirectional={BIDIRECTIONAL}")
+
+    # Load data
+    features = np.load(os.path.join("outputs", "selected_features.npy"))
+    labels = np.load(os.path.join("outputs", "selected_labels.npy"))
+    print(f"[MODEL_LSTM] Data shape: {features.shape}")
+
+    # Reshape to (batch, seq_len, features)
+    n_samples = features.shape[0]
+    if features.ndim == 2:
+        # Treat each feature as a timestep
+        seq_len = features.shape[1] // INPUT_SIZE
+        data = features[:, :seq_len * INPUT_SIZE].reshape(n_samples, seq_len, INPUT_SIZE)
+    else:
+        data = features
+
+    print(f"[MODEL_LSTM] Reshaped to: {data.shape}")
+
+    # Convert to tensors
+    X = torch.tensor(data, dtype=torch.float32)
+    y = torch.tensor(labels, dtype=torch.long)
+
+    # Train/val split
+    n_train = int(0.8 * n_samples)
+    indices = np.random.permutation(n_samples)
+    train_idx, val_idx = indices[:n_train], indices[n_train:]
+
+    train_loader = DataLoader(
+        TensorDataset(X[train_idx], y[train_idx]),
+        batch_size=32, shuffle=True
+    )
+    val_loader = DataLoader(
+        TensorDataset(X[val_idx], y[val_idx]),
+        batch_size=32, shuffle=False
+    )
+
+    # Model
+    model = BiLSTMClassifier().to(DEVICE)
+    print(f"[MODEL_LSTM] Parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    criterion = nn.CrossEntropyLoss()
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=10, factor=0.5)
+
+    best_val_acc = 0
+    patience_counter = 0
+    history = {"train_loss": [], "val_loss": [], "train_acc": [], "val_acc": []}
+
+    for epoch in range(100):
+        model.train()
+        train_loss, train_correct, train_total = 0, 0, 0
+        for batch_x, batch_y in train_loader:
+            batch_x, batch_y = batch_x.to(DEVICE), batch_y.to(DEVICE)
+            optimizer.zero_grad()
+            outputs = model(batch_x)
+            loss = criterion(outputs, batch_y)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            train_loss += loss.item()
+            _, predicted = outputs.max(1)
+            train_correct += predicted.eq(batch_y).sum().item()
+            train_total += batch_y.size(0)
+
+        model.eval()
+        val_loss, val_correct, val_total = 0, 0, 0
+        with torch.no_grad():
+            for batch_x, batch_y in val_loader:
+                batch_x, batch_y = batch_x.to(DEVICE), batch_y.to(DEVICE)
+                outputs = model(batch_x)
+                loss = criterion(outputs, batch_y)
+                val_loss += loss.item()
+                _, predicted = outputs.max(1)
+                val_correct += predicted.eq(batch_y).sum().item()
+                val_total += batch_y.size(0)
+
+        train_acc = train_correct / max(train_total, 1)
+        val_acc = val_correct / max(val_total, 1)
+        history["train_loss"].append(train_loss / len(train_loader))
+        history["val_loss"].append(val_loss / max(len(val_loader), 1))
+        history["train_acc"].append(train_acc)
+        history["val_acc"].append(val_acc)
+
+        scheduler.step(val_loss)
+
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            patience_counter = 0
+            torch.save(model.state_dict(), os.path.join("outputs", "best_lstm.pth"))
+        else:
+            patience_counter += 1
+            if patience_counter >= 20:
+                print(f"[MODEL_LSTM] Early stopping at epoch {epoch+1}")
+                break
+
+        if (epoch + 1) % 20 == 0:
+            print(f"[MODEL_LSTM] Epoch {epoch+1}/100 - Val Acc: {val_acc:.4f}")
+
+    print(f"[MODEL_LSTM] Training complete. Best val accuracy: {best_val_acc:.4f}")
+    with open(os.path.join("outputs", "lstm_history.json"), "w") as f:
+        json.dump(history, f, indent=2)
+
+    return model, history
+
+
+if __name__ == "__main__":
+    model, history = train_lstm()

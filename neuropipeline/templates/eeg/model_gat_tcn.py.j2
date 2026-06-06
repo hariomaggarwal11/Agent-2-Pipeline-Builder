@@ -1,0 +1,489 @@
+"""
+EEG GAT-TCN Model
+==================
+Dataset: {{ dataset_name }}
+Modality: EEG
+Purpose: Complete Graph Attention Network with Temporal Convolutional Network
+         for EEG classification. GATConv layers capture spatial electrode
+         relationships while TCN blocks model temporal dynamics. Fusion combines
+         both representations for final classification.
+
+Architecture: GATConv (spatial) + TCN (temporal) + {{ fusion_method }} fusion
+Reference: Velickovic et al. (2018) - Graph Attention Networks;
+           Bai et al. (2018) - Temporal Convolutional Networks
+"""
+
+import os
+import json
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
+from torch_geometric.nn import GATConv, global_mean_pool
+from torch_geometric.data import Data, Batch
+
+# Neurophysiological rationale:
+# EEG electrode arrays form a natural graph structure where edges represent
+# functional connectivity between brain regions. GATConv learns to weight
+# channel relationships adaptively, capturing task-relevant spatial patterns
+# (e.g., interhemispheric asymmetry for emotion, sensorimotor regions for MI).
+# TCN captures temporal dynamics across multiple timescales without the
+# vanishing gradient problem of RNNs (Bai et al., 2018).
+
+SEED = 42
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
+# Configuration
+DATASET_NAME = "{{ dataset_name }}"
+N_HEADS = {{ n_heads }}
+HIDDEN_DIM = {{ hidden_dim }}
+GAT_LAYERS = {{ gat_layers }}
+GAT_DROPOUT = {{ gat_dropout }}
+TCN_LEVELS = {{ tcn_levels }}
+KERNEL_SIZE = {{ kernel_size }}
+TCN_FILTERS = {{ tcn_filters }}
+TCN_DROPOUT = {{ tcn_dropout }}
+FUSION_METHOD = "{{ fusion_method }}"  # concat, attention, add
+OPTIMIZER = "{{ optimizer }}"  # Adam, AdamW
+LR = {{ lr }}
+LOSS_FN = "{{ loss_fn }}"  # cross_entropy, focal
+{% if scheduler is defined %}
+SCHEDULER = "{{ scheduler }}"  # cosine, step, plateau
+{% endif %}
+EPOCHS = {{ epochs }}
+BATCH_SIZE = {{ batch_size }}
+EARLY_STOPPING_PATIENCE = {{ early_stopping_patience }}
+N_CLASSES = {{ n_classes }}
+N_CHANNELS = {{ n_channels }}
+N_FEATURES = {{ n_features }}
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+os.makedirs("outputs", exist_ok=True)
+
+
+class TCNBlock(nn.Module):
+    """Temporal Convolutional Network block with residual connection.
+
+    Implements dilated causal convolutions for multi-scale temporal modeling.
+    Each block doubles the receptive field through dilation (Bai et al., 2018).
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size, dilation, dropout):
+        super().__init__()
+        padding = (kernel_size - 1) * dilation
+        self.conv1 = nn.Conv1d(
+            in_channels, out_channels, kernel_size,
+            padding=padding, dilation=dilation
+        )
+        self.bn1 = nn.BatchNorm1d(out_channels)
+        self.conv2 = nn.Conv1d(
+            out_channels, out_channels, kernel_size,
+            padding=padding, dilation=dilation
+        )
+        self.bn2 = nn.BatchNorm1d(out_channels)
+        self.dropout = nn.Dropout(dropout)
+        self.residual = nn.Conv1d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        """Forward pass with causal padding trimmed."""
+        residual = self.residual(x)
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = out[:, :, :x.size(2)]  # Trim causal padding
+        out = self.dropout(out)
+        out = self.relu(self.bn2(self.conv2(out)))
+        out = out[:, :, :x.size(2)]  # Trim causal padding
+        out = self.dropout(out)
+        return self.relu(out + residual)
+
+
+class TCN(nn.Module):
+    """Temporal Convolutional Network with exponentially increasing dilation."""
+
+    def __init__(self, input_dim, n_filters, n_levels, kernel_size, dropout):
+        super().__init__()
+        layers = []
+        for i in range(n_levels):
+            in_ch = input_dim if i == 0 else n_filters
+            dilation = 2 ** i
+            layers.append(TCNBlock(in_ch, n_filters, kernel_size, dilation, dropout))
+        self.network = nn.Sequential(*layers)
+        self.pool = nn.AdaptiveAvgPool1d(1)
+
+    def forward(self, x):
+        """Input: (batch, channels, time) -> Output: (batch, n_filters)"""
+        out = self.network(x)
+        out = self.pool(out).squeeze(-1)
+        return out
+
+
+class GATEncoder(nn.Module):
+    """Graph Attention Network encoder for spatial EEG features.
+
+    Multi-head attention learns electrode importance weights, capturing
+    task-relevant spatial patterns in the EEG montage graph structure.
+    """
+
+    def __init__(self, in_features, hidden_dim, n_heads, n_layers, dropout):
+        super().__init__()
+        self.layers = nn.ModuleList()
+        self.layers.append(GATConv(in_features, hidden_dim, heads=n_heads, dropout=dropout, concat=True))
+        for _ in range(n_layers - 1):
+            self.layers.append(GATConv(hidden_dim * n_heads, hidden_dim, heads=n_heads, dropout=dropout, concat=True))
+        self.output_dim = hidden_dim * n_heads
+        self.dropout = dropout
+
+    def forward(self, x, edge_index, batch):
+        """Forward pass through GAT layers.
+
+        Parameters
+        ----------
+        x : Tensor
+            Node features (n_nodes, in_features).
+        edge_index : Tensor
+            Graph connectivity (2, n_edges).
+        batch : Tensor
+            Batch assignment for each node.
+
+        Returns
+        -------
+        Tensor
+            Graph-level representation (batch_size, output_dim).
+        """
+        for layer in self.layers:
+            x = F.dropout(x, p=self.dropout, training=self.training)
+            x = F.elu(layer(x, edge_index))
+        # Global pooling for graph-level representation
+        out = global_mean_pool(x, batch)
+        return out
+
+
+class GATTCN(nn.Module):
+    """GAT-TCN fusion model for EEG classification.
+
+    Combines Graph Attention Network spatial encoding with Temporal
+    Convolutional Network temporal modeling via {{ fusion_method }} fusion.
+    """
+
+    def __init__(self):
+        super().__init__()
+        # Spatial encoder (GAT)
+        self.gat = GATEncoder(
+            in_features=N_FEATURES,
+            hidden_dim=HIDDEN_DIM,
+            n_heads=N_HEADS,
+            n_layers=GAT_LAYERS,
+            dropout=GAT_DROPOUT,
+        )
+        # Temporal encoder (TCN)
+        self.tcn = TCN(
+            input_dim=N_CHANNELS,
+            n_filters=TCN_FILTERS,
+            n_levels=TCN_LEVELS,
+            kernel_size=KERNEL_SIZE,
+            dropout=TCN_DROPOUT,
+        )
+
+        # Fusion and classification
+        gat_out_dim = HIDDEN_DIM * N_HEADS
+        tcn_out_dim = TCN_FILTERS
+        {% if fusion_method == "concat" %}
+        fusion_dim = gat_out_dim + tcn_out_dim
+        {% elif fusion_method == "add" %}
+        self.gat_proj = nn.Linear(gat_out_dim, HIDDEN_DIM)
+        self.tcn_proj = nn.Linear(tcn_out_dim, HIDDEN_DIM)
+        fusion_dim = HIDDEN_DIM
+        {% elif fusion_method == "attention" %}
+        self.gat_proj = nn.Linear(gat_out_dim, HIDDEN_DIM)
+        self.tcn_proj = nn.Linear(tcn_out_dim, HIDDEN_DIM)
+        self.attn_weights = nn.Linear(HIDDEN_DIM * 2, 2)
+        fusion_dim = HIDDEN_DIM
+        {% endif %}
+
+        self.classifier = nn.Sequential(
+            nn.Linear(fusion_dim, HIDDEN_DIM),
+            nn.ReLU(),
+            nn.Dropout(GAT_DROPOUT),
+            nn.Linear(HIDDEN_DIM, N_CLASSES),
+        )
+        self._init_weights()
+
+    def _init_weights(self):
+        """Initialize weights using Xavier/Kaiming initialization."""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Conv1d):
+                nn.init.kaiming_normal_(m.weight)
+
+    def forward(self, graph_data, temporal_data):
+        """Forward pass combining spatial and temporal pathways.
+
+        Parameters
+        ----------
+        graph_data : torch_geometric.data.Batch
+            Batched graph data with node features and edge_index.
+        temporal_data : Tensor
+            Temporal input (batch, channels, time).
+
+        Returns
+        -------
+        Tensor
+            Class logits (batch, n_classes).
+        """
+        # Spatial pathway
+        gat_out = self.gat(graph_data.x, graph_data.edge_index, graph_data.batch)
+        # Temporal pathway
+        tcn_out = self.tcn(temporal_data)
+
+        # Fusion
+        {% if fusion_method == "concat" %}
+        fused = torch.cat([gat_out, tcn_out], dim=1)
+        {% elif fusion_method == "add" %}
+        gat_proj = self.gat_proj(gat_out)
+        tcn_proj = self.tcn_proj(tcn_out)
+        fused = gat_proj + tcn_proj
+        {% elif fusion_method == "attention" %}
+        gat_proj = self.gat_proj(gat_out)
+        tcn_proj = self.tcn_proj(tcn_out)
+        combined = torch.cat([gat_proj, tcn_proj], dim=1)
+        weights = F.softmax(self.attn_weights(combined), dim=1)
+        fused = weights[:, 0:1] * gat_proj + weights[:, 1:2] * tcn_proj
+        {% endif %}
+
+        return self.classifier(fused)
+
+
+def build_graph_edges(n_channels):
+    """Build fully-connected graph for EEG electrode array.
+
+    EEG electrodes are treated as graph nodes with edges representing
+    potential functional connectivity. Attention weights learn to prune
+    irrelevant connections during training.
+
+    Parameters
+    ----------
+    n_channels : int
+        Number of EEG channels (graph nodes).
+
+    Returns
+    -------
+    Tensor
+        Edge index tensor (2, n_edges).
+    """
+    # REVIEW: Consider using distance-based connectivity instead of fully-connected
+    edges = []
+    for i in range(n_channels):
+        for j in range(n_channels):
+            if i != j:
+                edges.append([i, j])
+    edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
+    return edge_index
+
+
+def compute_class_weights(labels):
+    """Compute inverse frequency class weights for imbalanced datasets.
+
+    Parameters
+    ----------
+    labels : np.ndarray
+        Training labels.
+
+    Returns
+    -------
+    Tensor
+        Class weights tensor.
+    """
+    unique, counts = np.unique(labels, return_counts=True)
+    weights = 1.0 / counts
+    weights = weights / weights.sum() * len(unique)
+    return torch.tensor(weights, dtype=torch.float32).to(DEVICE)
+
+
+def train_model():
+    """Execute the full training pipeline."""
+    print(f"[MODEL_GAT_TCN] Starting training for: {DATASET_NAME}")
+    print(f"[MODEL_GAT_TCN] Device: {DEVICE}")
+    print(f"[MODEL_GAT_TCN] Architecture: GAT({GAT_LAYERS}L, {N_HEADS}H) + TCN({TCN_LEVELS}L, k={KERNEL_SIZE})")
+
+    # Load data
+    features = np.load(os.path.join("outputs", "selected_features.npy"))
+    labels = np.load(os.path.join("outputs", "selected_labels.npy"))
+    print(f"[MODEL_GAT_TCN] Data: {features.shape}, Classes: {np.unique(labels)}")
+
+    # Prepare data
+    n_samples = features.shape[0]
+    # Reshape for temporal: (batch, channels, time)
+    temporal_data = torch.tensor(
+        features.reshape(n_samples, N_CHANNELS, -1), dtype=torch.float32
+    )
+    labels_tensor = torch.tensor(labels, dtype=torch.long)
+
+    # Build graph data
+    edge_index = build_graph_edges(N_CHANNELS)
+    graph_features = torch.tensor(features.reshape(n_samples, N_CHANNELS, -1), dtype=torch.float32)
+
+    # Train/val split
+    n_train = int(0.8 * n_samples)
+    indices = np.random.permutation(n_samples)
+    train_idx, val_idx = indices[:n_train], indices[n_train:]
+
+    # Class weights for imbalanced data
+    class_weights = compute_class_weights(labels[train_idx])
+
+    # Initialize model
+    model = GATTCN().to(DEVICE)
+    print(f"[MODEL_GAT_TCN] Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+    # Optimizer
+    {% if optimizer == "Adam" %}
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=1e-4)
+    {% elif optimizer == "AdamW" %}
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-2)
+    {% endif %}
+
+    # Loss function
+    {% if loss_fn == "focal" %}
+    class FocalLoss(nn.Module):
+        def __init__(self, alpha=1, gamma=2, weight=None):
+            super().__init__()
+            self.alpha = alpha
+            self.gamma = gamma
+            self.weight = weight
+
+        def forward(self, inputs, targets):
+            ce_loss = F.cross_entropy(inputs, targets, weight=self.weight, reduction="none")
+            pt = torch.exp(-ce_loss)
+            focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
+            return focal_loss.mean()
+    criterion = FocalLoss(weight=class_weights)
+    {% else %}
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    {% endif %}
+
+    # Scheduler
+    {% if scheduler is defined %}
+    {% if scheduler == "cosine" %}
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+    {% elif scheduler == "step" %}
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.1)
+    {% elif scheduler == "plateau" %}
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=10, factor=0.5)
+    {% endif %}
+    {% endif %}
+
+    # Training loop with early stopping
+    best_val_loss = float("inf")
+    patience_counter = 0
+    history = {"train_loss": [], "val_loss": [], "train_acc": [], "val_acc": []}
+
+    for epoch in range(EPOCHS):
+        model.train()
+        train_losses = []
+        train_correct = 0
+        train_total = 0
+
+        # Mini-batch training
+        for start in range(0, len(train_idx), BATCH_SIZE):
+            batch_idx = train_idx[start:start + BATCH_SIZE]
+            batch_temporal = temporal_data[batch_idx].to(DEVICE)
+            batch_labels = labels_tensor[batch_idx].to(DEVICE)
+
+            # Build batch of graphs
+            graphs = []
+            for i in batch_idx:
+                node_feats = graph_features[i]  # (n_channels, n_features)
+                g = Data(x=node_feats, edge_index=edge_index)
+                graphs.append(g)
+            batch_graph = Batch.from_data_list(graphs).to(DEVICE)
+
+            optimizer.zero_grad()
+            outputs = model(batch_graph, batch_temporal)
+            loss = criterion(outputs, batch_labels)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+
+            train_losses.append(loss.item())
+            _, predicted = outputs.max(1)
+            train_correct += predicted.eq(batch_labels).sum().item()
+            train_total += len(batch_labels)
+
+        # Validation
+        model.eval()
+        val_losses = []
+        val_correct = 0
+        val_total = 0
+
+        with torch.no_grad():
+            for start in range(0, len(val_idx), BATCH_SIZE):
+                batch_idx = val_idx[start:start + BATCH_SIZE]
+                batch_temporal = temporal_data[batch_idx].to(DEVICE)
+                batch_labels = labels_tensor[batch_idx].to(DEVICE)
+
+                graphs = []
+                for i in batch_idx:
+                    node_feats = graph_features[i]
+                    g = Data(x=node_feats, edge_index=edge_index)
+                    graphs.append(g)
+                batch_graph = Batch.from_data_list(graphs).to(DEVICE)
+
+                outputs = model(batch_graph, batch_temporal)
+                loss = criterion(outputs, batch_labels)
+                val_losses.append(loss.item())
+                _, predicted = outputs.max(1)
+                val_correct += predicted.eq(batch_labels).sum().item()
+                val_total += len(batch_labels)
+
+        train_loss = np.mean(train_losses)
+        val_loss = np.mean(val_losses)
+        train_acc = train_correct / max(train_total, 1)
+        val_acc = val_correct / max(val_total, 1)
+
+        history["train_loss"].append(train_loss)
+        history["val_loss"].append(val_loss)
+        history["train_acc"].append(train_acc)
+        history["val_acc"].append(val_acc)
+
+        {% if scheduler is defined %}
+        {% if scheduler == "plateau" %}
+        scheduler.step(val_loss)
+        {% else %}
+        scheduler.step()
+        {% endif %}
+        {% endif %}
+
+        if (epoch + 1) % 10 == 0 or epoch == 0:
+            print(f"[MODEL_GAT_TCN] Epoch {epoch+1}/{EPOCHS} - "
+                  f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, "
+                  f"Train Acc: {train_acc:.4f}, Val Acc: {val_acc:.4f}")
+
+        # Early stopping
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+            torch.save(model.state_dict(), os.path.join("outputs", "best_model.pth"))
+        else:
+            patience_counter += 1
+            if patience_counter >= EARLY_STOPPING_PATIENCE:
+                print(f"[MODEL_GAT_TCN] Early stopping at epoch {epoch+1}")
+                break
+
+    # Save training history
+    history_path = os.path.join("outputs", "training_history.json")
+    with open(history_path, "w") as f:
+        json.dump(history, f, indent=2)
+    print(f"[MODEL_GAT_TCN] Training complete. Best val loss: {best_val_loss:.4f}")
+    print(f"[MODEL_GAT_TCN] History saved: {history_path}")
+
+    return model, history
+
+
+if __name__ == "__main__":
+    model, history = train_model()

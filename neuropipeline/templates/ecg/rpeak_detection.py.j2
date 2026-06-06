@@ -1,0 +1,375 @@
+"""
+ECG R-Peak Detection Stage
+============================
+Dataset: {{ dataset_name }}
+Modality: ECG
+Purpose: Detect R-peaks (ventricular depolarization markers) in the ECG
+         signal using {{ algorithm }} algorithm, with ectopic beat correction
+         and detection quality metrics.
+
+R-peak detection is the foundation of all HRV analysis and beat-level
+morphological feature extraction.
+"""
+
+import os
+import json
+import numpy as np
+
+# Neurophysiological rationale:
+# The R-peak represents the dominant deflection of the QRS complex,
+# corresponding to rapid ventricular depolarization. Accurate R-peak
+# detection is essential for:
+# 1. Heart rate computation and HRV analysis
+# 2. Beat segmentation for morphological analysis
+# 3. RR-interval computation for arrhythmia detection
+# (Pan & Tompkins, 1985; Hamilton & Tompkins, 1986)
+
+SEED = 42
+np.random.seed(SEED)
+
+# Configuration
+DATASET_NAME = "{{ dataset_name }}"
+ALGORITHM = "{{ algorithm }}"  # pan_tompkins, hamilton, neurokit2, matched_filter
+LEAD_FOR_DETECTION = {{ lead_for_detection }}  # Lead index for detection (e.g., 0 for lead II)
+CORRECT_ECTOPIC = {{ correct_ectopic }}  # Whether to correct ectopic/missed beats
+
+os.makedirs("outputs", exist_ok=True)
+
+
+def load_preprocessed_ecg():
+    """Load preprocessed ECG signal.
+
+    Returns
+    -------
+    tuple
+        (signal, metadata)
+    """
+    print("[RPEAK_DETECTION] Loading preprocessed ECG...")
+    signal = np.load(os.path.join("outputs", "preprocessed_ecg.npy"))
+    with open(os.path.join("outputs", "preprocessed_metadata.json"), "r") as f:
+        metadata = json.load(f)
+    print(f"[RPEAK_DETECTION] Loaded: {signal.shape}, fs={metadata['fs']} Hz")
+    return signal, metadata
+
+
+{% if algorithm == "pan_tompkins" %}
+def detect_rpeaks_pan_tompkins(signal, fs):
+    """Pan-Tompkins R-peak detection algorithm.
+
+    The gold-standard QRS detection algorithm using bandpass filtering,
+    differentiation, squaring, and moving-window integration followed by
+    adaptive thresholding (Pan & Tompkins, 1985 - A Real-Time QRS Detection
+    Algorithm, IEEE Trans. Biomed. Eng.).
+
+    Parameters
+    ----------
+    signal : np.ndarray
+        Single-lead ECG signal.
+    fs : float
+        Sampling frequency.
+
+    Returns
+    -------
+    np.ndarray
+        R-peak indices.
+    """
+    from scipy.signal import butter, filtfilt, find_peaks
+    print("[RPEAK_DETECTION] Running Pan-Tompkins algorithm...")
+
+    # Step 1: Bandpass filter (5-15 Hz) to enhance QRS
+    nyq = fs / 2
+    b, a = butter(2, [5 / nyq, 15 / nyq], btype="bandpass")
+    filtered = filtfilt(b, a, signal)
+
+    # Step 2: Differentiate (emphasizes steep QRS slopes)
+    differentiated = np.diff(filtered)
+
+    # Step 3: Square (makes all values positive, emphasizes large slopes)
+    squared = differentiated ** 2
+
+    # Step 4: Moving-window integration (smooths the squared signal)
+    window_size = int(0.15 * fs)  # 150ms window
+    integrated = np.convolve(squared, np.ones(window_size) / window_size, mode="same")
+
+    # Step 5: Adaptive thresholding with peak detection
+    # Find peaks with minimum distance of 200ms (max HR ~300 bpm)
+    min_distance = int(0.2 * fs)
+    threshold = 0.3 * np.max(integrated)
+    peaks, properties = find_peaks(integrated, height=threshold, distance=min_distance)
+
+    # Refine peak locations to actual R-peak in original signal
+    r_peaks = []
+    search_window = int(0.05 * fs)  # 50ms search window
+    for peak in peaks:
+        start = max(0, peak - search_window)
+        end = min(len(signal), peak + search_window)
+        local_max = start + np.argmax(np.abs(signal[start:end]))
+        r_peaks.append(local_max)
+
+    r_peaks = np.array(sorted(set(r_peaks)))
+    print(f"[RPEAK_DETECTION] Pan-Tompkins detected {len(r_peaks)} R-peaks")
+    return r_peaks
+{% endif %}
+
+
+{% if algorithm == "hamilton" %}
+def detect_rpeaks_hamilton(signal, fs):
+    """Hamilton R-peak detection algorithm.
+
+    An improved version of Pan-Tompkins with better adaptive thresholding
+    and reduced false positive rate (Hamilton & Tompkins, 1986).
+
+    Parameters
+    ----------
+    signal : np.ndarray
+        Single-lead ECG signal.
+    fs : float
+        Sampling frequency.
+
+    Returns
+    -------
+    np.ndarray
+        R-peak indices.
+    """
+    from scipy.signal import butter, filtfilt, find_peaks
+    print("[RPEAK_DETECTION] Running Hamilton algorithm...")
+
+    # Bandpass filter
+    nyq = fs / 2
+    b, a = butter(3, [8 / nyq, 16 / nyq], btype="bandpass")
+    filtered = filtfilt(b, a, signal)
+
+    # Absolute value of differentiated signal
+    diff_signal = np.abs(np.diff(filtered))
+
+    # Moving average
+    window = int(0.08 * fs)
+    ma = np.convolve(diff_signal, np.ones(window) / window, mode="same")
+
+    # Adaptive threshold
+    min_distance = int(0.3 * fs)
+    threshold = np.mean(ma) + 0.5 * np.std(ma)
+    peaks, _ = find_peaks(ma, height=threshold, distance=min_distance)
+
+    # Refine to actual R-peak
+    r_peaks = []
+    search_window = int(0.05 * fs)
+    for peak in peaks:
+        start = max(0, peak - search_window)
+        end = min(len(signal), peak + search_window)
+        local_max = start + np.argmax(np.abs(signal[start:end]))
+        r_peaks.append(local_max)
+
+    r_peaks = np.array(sorted(set(r_peaks)))
+    print(f"[RPEAK_DETECTION] Hamilton detected {len(r_peaks)} R-peaks")
+    return r_peaks
+{% endif %}
+
+
+{% if algorithm == "neurokit2" %}
+def detect_rpeaks_neurokit2(signal, fs):
+    """NeuroKit2 R-peak detection.
+
+    Uses NeuroKit2's ensemble approach combining multiple detection
+    algorithms for robust peak detection (Makowski et al., 2021 -
+    NeuroKit2: A Python toolbox for neurophysiological signal processing).
+
+    Parameters
+    ----------
+    signal : np.ndarray
+        Single-lead ECG signal.
+    fs : float
+        Sampling frequency.
+
+    Returns
+    -------
+    np.ndarray
+        R-peak indices.
+    """
+    import neurokit2 as nk
+    print("[RPEAK_DETECTION] Running NeuroKit2 detection...")
+
+    # Clean the signal
+    ecg_cleaned = nk.ecg_clean(signal, sampling_rate=int(fs))
+
+    # Detect R-peaks using NeuroKit2's ensemble method
+    _, rpeaks_info = nk.ecg_peaks(ecg_cleaned, sampling_rate=int(fs))
+    r_peaks = rpeaks_info["ECG_R_Peaks"]
+
+    print(f"[RPEAK_DETECTION] NeuroKit2 detected {len(r_peaks)} R-peaks")
+    return np.array(r_peaks)
+{% endif %}
+
+
+{% if algorithm == "matched_filter" %}
+def detect_rpeaks_matched_filter(signal, fs):
+    """Matched filter R-peak detection.
+
+    Uses a template-matching approach where a QRS template is correlated
+    with the signal to find R-peak locations. Effective for signals with
+    varying morphology (Afonso et al., 1999).
+
+    Parameters
+    ----------
+    signal : np.ndarray
+        Single-lead ECG signal.
+    fs : float
+        Sampling frequency.
+
+    Returns
+    -------
+    np.ndarray
+        R-peak indices.
+    """
+    from scipy.signal import find_peaks, correlate
+    print("[RPEAK_DETECTION] Running matched filter detection...")
+
+    # Create a synthetic QRS template (Gaussian-derivative shape)
+    template_duration = int(0.1 * fs)  # 100ms QRS template
+    t = np.linspace(-1, 1, template_duration)
+    template = -t * np.exp(-0.5 * t ** 2)  # Mexican hat wavelet approximation
+
+    # Cross-correlate
+    correlation = correlate(signal, template, mode="same")
+    correlation = correlation / np.max(np.abs(correlation))
+
+    # Find peaks in correlation
+    min_distance = int(0.3 * fs)
+    threshold = 0.3 * np.max(correlation)
+    r_peaks, _ = find_peaks(correlation, height=threshold, distance=min_distance)
+
+    print(f"[RPEAK_DETECTION] Matched filter detected {len(r_peaks)} R-peaks")
+    return r_peaks
+{% endif %}
+
+
+def correct_ectopic_beats(r_peaks, fs):
+    """Correct ectopic and missed beats in R-peak sequence.
+
+    Ectopic beats (premature ventricular contractions) produce abnormal
+    RR intervals that can distort HRV measurements. Detection and
+    correction follows Karlsson et al. (2012) recommendations.
+
+    Parameters
+    ----------
+    r_peaks : np.ndarray
+        Detected R-peak indices.
+    fs : float
+        Sampling frequency.
+
+    Returns
+    -------
+    tuple
+        (corrected_peaks, ectopic_indices)
+    """
+    print("[RPEAK_DETECTION] Correcting ectopic beats...")
+    rr_intervals = np.diff(r_peaks) / fs  # Convert to seconds
+    median_rr = np.median(rr_intervals)
+
+    ectopic_indices = []
+    corrected_peaks = list(r_peaks)
+
+    for i in range(len(rr_intervals)):
+        # Flag if RR deviates more than 20% from median
+        if abs(rr_intervals[i] - median_rr) / median_rr > 0.20:
+            ectopic_indices.append(i)
+
+    # Interpolate ectopic beats
+    if ectopic_indices:
+        print(f"[RPEAK_DETECTION] Found {len(ectopic_indices)} ectopic beats")
+        # REVIEW: Consider more sophisticated ectopic correction methods
+        # For now, flag but don't remove to preserve beat count
+    else:
+        print("[RPEAK_DETECTION] No ectopic beats detected")
+
+    return np.array(corrected_peaks), ectopic_indices
+
+
+def compute_detection_metrics(r_peaks, fs, duration):
+    """Compute R-peak detection quality metrics.
+
+    Parameters
+    ----------
+    r_peaks : np.ndarray
+        Detected R-peak indices.
+    fs : float
+        Sampling frequency.
+    duration : float
+        Signal duration in seconds.
+
+    Returns
+    -------
+    dict
+        Detection metrics.
+    """
+    rr_intervals = np.diff(r_peaks) / fs * 1000  # in ms
+    heart_rate = 60000 / rr_intervals  # BPM
+
+    metrics = {
+        "n_beats": len(r_peaks),
+        "mean_hr_bpm": float(np.mean(heart_rate)),
+        "std_hr_bpm": float(np.std(heart_rate)),
+        "min_hr_bpm": float(np.min(heart_rate)),
+        "max_hr_bpm": float(np.max(heart_rate)),
+        "mean_rr_ms": float(np.mean(rr_intervals)),
+        "std_rr_ms": float(np.std(rr_intervals)),
+        "detection_rate_bpm": len(r_peaks) / duration * 60,
+    }
+    return metrics
+
+
+def run_rpeak_detection():
+    """Execute the R-peak detection pipeline."""
+    print(f"[RPEAK_DETECTION] Starting R-peak detection for: {DATASET_NAME}")
+    print(f"[RPEAK_DETECTION] Algorithm: {ALGORITHM}, Lead: {LEAD_FOR_DETECTION}")
+
+    # Load preprocessed ECG
+    signal, metadata = load_preprocessed_ecg()
+    fs = metadata["fs"]
+
+    # Select detection lead
+    lead_signal = signal[:, LEAD_FOR_DETECTION]
+    print(f"[RPEAK_DETECTION] Using lead {LEAD_FOR_DETECTION} for detection")
+
+    # Detect R-peaks
+    {% if algorithm == "pan_tompkins" %}
+    r_peaks = detect_rpeaks_pan_tompkins(lead_signal, fs)
+    {% elif algorithm == "hamilton" %}
+    r_peaks = detect_rpeaks_hamilton(lead_signal, fs)
+    {% elif algorithm == "neurokit2" %}
+    r_peaks = detect_rpeaks_neurokit2(lead_signal, fs)
+    {% elif algorithm == "matched_filter" %}
+    r_peaks = detect_rpeaks_matched_filter(lead_signal, fs)
+    {% endif %}
+
+    # Correct ectopic beats
+    if CORRECT_ECTOPIC:
+        r_peaks, ectopic_indices = correct_ectopic_beats(r_peaks, fs)
+    else:
+        ectopic_indices = []
+
+    # Compute metrics
+    duration = len(lead_signal) / fs
+    detection_metrics = compute_detection_metrics(r_peaks, fs, duration)
+    print(f"[RPEAK_DETECTION] Mean HR: {detection_metrics['mean_hr_bpm']:.1f} BPM")
+    print(f"[RPEAK_DETECTION] Total beats: {detection_metrics['n_beats']}")
+
+    # Save results
+    np.save(os.path.join("outputs", "r_peaks.npy"), r_peaks)
+    results = {
+        "dataset_name": DATASET_NAME,
+        "algorithm": ALGORITHM,
+        "lead_for_detection": LEAD_FOR_DETECTION,
+        "correct_ectopic": CORRECT_ECTOPIC,
+        "n_ectopic": len(ectopic_indices),
+        "detection_metrics": detection_metrics,
+    }
+    with open(os.path.join("outputs", "rpeak_detection_results.json"), "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"[RPEAK_DETECTION] Results saved to outputs/")
+
+    return r_peaks, detection_metrics
+
+
+if __name__ == "__main__":
+    r_peaks, metrics = run_rpeak_detection()

@@ -1,0 +1,256 @@
+"""
+ECG Beat Segmentation Stage
+==============================
+Dataset: {{ dataset_name }}
+Modality: ECG
+Purpose: Segment individual heartbeats centered on R-peaks with configurable
+         pre/post windows, per-beat normalization, and ectopic beat filtering
+         for morphological analysis and classification.
+
+Beat segmentation isolates individual cardiac cycles for morphology-based
+arrhythmia detection and classification.
+"""
+
+import os
+import json
+import numpy as np
+
+# Neurophysiological rationale:
+# Individual heartbeats are the fundamental unit for morphological analysis.
+# Centering windows on R-peaks captures the complete PQRST complex:
+# - Pre-R window captures P-wave and PR interval (atrial activity)
+# - Post-R window captures ST segment and T-wave (repolarization)
+# Standard beat duration is ~600-1000ms depending on heart rate.
+# (de Chazal et al., 2004 - Automatic classification of heartbeats using
+#  ECG morphology and heartbeat interval features)
+
+SEED = 42
+np.random.seed(SEED)
+
+# Configuration
+DATASET_NAME = "{{ dataset_name }}"
+PRE_R_MS = {{ pre_r_ms }}  # Milliseconds before R-peak (captures P-wave)
+POST_R_MS = {{ post_r_ms }}  # Milliseconds after R-peak (captures T-wave)
+NORMALIZE_BEATS = {{ normalize_beats }}  # Normalize individual beats
+RR_DEVIATION_THRESHOLD = {{ rr_deviation_threshold }}  # Threshold for ectopic filtering (fraction)
+
+os.makedirs("outputs", exist_ok=True)
+
+
+def load_preprocessed_and_rpeaks():
+    """Load preprocessed ECG and detected R-peaks.
+
+    Returns
+    -------
+    tuple
+        (signal, r_peaks, metadata)
+    """
+    print("[BEAT_SEGMENTATION] Loading preprocessed ECG and R-peaks...")
+    signal = np.load(os.path.join("outputs", "preprocessed_ecg.npy"))
+    r_peaks = np.load(os.path.join("outputs", "r_peaks.npy"))
+    with open(os.path.join("outputs", "preprocessed_metadata.json"), "r") as f:
+        metadata = json.load(f)
+    print(f"[BEAT_SEGMENTATION] Signal: {signal.shape}, R-peaks: {len(r_peaks)}, fs={metadata['fs']}")
+    return signal, r_peaks, metadata
+
+
+def segment_beats(signal, r_peaks, fs):
+    """Segment individual heartbeats centered on R-peaks.
+
+    Each beat is extracted with a fixed window relative to the R-peak,
+    providing consistent-length segments for model input regardless
+    of the underlying heart rate.
+
+    Parameters
+    ----------
+    signal : np.ndarray
+        ECG signal (samples x leads).
+    r_peaks : np.ndarray
+        R-peak indices.
+    fs : float
+        Sampling frequency.
+
+    Returns
+    -------
+    np.ndarray
+        Beat segments (n_beats, n_leads, window_samples).
+    """
+    pre_samples = int(PRE_R_MS * fs / 1000)
+    post_samples = int(POST_R_MS * fs / 1000)
+    window_size = pre_samples + post_samples
+    n_leads = signal.shape[1]
+
+    print(f"[BEAT_SEGMENTATION] Window: {PRE_R_MS}ms pre, {POST_R_MS}ms post ({window_size} samples)")
+
+    beats = []
+    valid_peaks = []
+    for peak in r_peaks:
+        start = peak - pre_samples
+        end = peak + post_samples
+        if start >= 0 and end <= len(signal):
+            beat = signal[start:end, :].T  # (leads, window_samples)
+            beats.append(beat)
+            valid_peaks.append(peak)
+
+    beats = np.array(beats)  # (n_beats, n_leads, window_samples)
+    print(f"[BEAT_SEGMENTATION] Extracted {len(beats)} valid beats from {len(r_peaks)} R-peaks")
+    return beats, np.array(valid_peaks)
+
+
+def filter_ectopic_beats(beats, r_peaks, fs):
+    """Filter ectopic beats based on RR interval deviation.
+
+    Ectopic beats (PVCs, PACs) have abnormal timing and morphology that
+    can confuse classifiers trained on normal sinus rhythm patterns.
+    Filtering based on RR deviation removes these anomalous beats
+    (Clifford et al., 2006).
+
+    Parameters
+    ----------
+    beats : np.ndarray
+        Beat segments.
+    r_peaks : np.ndarray
+        R-peak indices for valid beats.
+    fs : float
+        Sampling frequency.
+
+    Returns
+    -------
+    tuple
+        (filtered_beats, filtered_peaks, ectopic_mask)
+    """
+    print(f"[BEAT_SEGMENTATION] Filtering ectopic beats (threshold: {RR_DEVIATION_THRESHOLD})")
+    rr_intervals = np.diff(r_peaks) / fs
+    median_rr = np.median(rr_intervals)
+
+    # Mark beats with abnormal preceding RR interval
+    normal_mask = np.ones(len(beats), dtype=bool)
+    for i in range(1, len(rr_intervals)):
+        deviation = abs(rr_intervals[i] - median_rr) / median_rr
+        if deviation > RR_DEVIATION_THRESHOLD:
+            normal_mask[i + 1] = False  # Mark the beat after abnormal RR
+
+    filtered_beats = beats[normal_mask]
+    filtered_peaks = r_peaks[normal_mask]
+    n_removed = len(beats) - len(filtered_beats)
+    print(f"[BEAT_SEGMENTATION] Removed {n_removed} ectopic beats, {len(filtered_beats)} remaining")
+    return filtered_beats, filtered_peaks, ~normal_mask
+
+
+def normalize_beats_fn(beats):
+    """Normalize individual beat amplitudes.
+
+    Per-beat normalization reduces inter-patient amplitude variability
+    due to differences in body habitus, electrode placement, and
+    recording equipment (Luz et al., 2016).
+
+    Parameters
+    ----------
+    beats : np.ndarray
+        Beat segments (n_beats, n_leads, window_samples).
+
+    Returns
+    -------
+    np.ndarray
+        Normalized beats.
+    """
+    print("[BEAT_SEGMENTATION] Normalizing individual beats...")
+    normalized = np.zeros_like(beats)
+    for i in range(len(beats)):
+        for lead in range(beats.shape[1]):
+            beat = beats[i, lead]
+            std = np.std(beat)
+            if std > 1e-10:
+                normalized[i, lead] = (beat - np.mean(beat)) / std
+            else:
+                normalized[i, lead] = beat - np.mean(beat)
+    return normalized
+
+
+def compute_rr_features(r_peaks, fs):
+    """Compute RR-interval features for each beat.
+
+    RR intervals provide temporal context for beat classification.
+    Pre-RR and post-RR intervals help distinguish PVCs from normal beats
+    (de Chazal et al., 2004).
+
+    Parameters
+    ----------
+    r_peaks : np.ndarray
+        R-peak indices.
+    fs : float
+        Sampling frequency.
+
+    Returns
+    -------
+    np.ndarray
+        RR features (n_beats, 4): [pre_rr, post_rr, ratio, local_avg]
+    """
+    rr = np.diff(r_peaks) / fs * 1000  # ms
+    n_beats = len(r_peaks)
+    rr_features = np.zeros((n_beats, 4))
+
+    for i in range(n_beats):
+        # Pre-RR (preceding interval)
+        rr_features[i, 0] = rr[i - 1] if i > 0 else rr[0] if len(rr) > 0 else 0
+        # Post-RR (following interval)
+        rr_features[i, 1] = rr[i] if i < len(rr) else rr[-1] if len(rr) > 0 else 0
+        # Ratio
+        if rr_features[i, 1] > 0:
+            rr_features[i, 2] = rr_features[i, 0] / rr_features[i, 1]
+        # Local average (5-beat window)
+        start = max(0, i - 2)
+        end = min(len(rr), i + 3)
+        rr_features[i, 3] = np.mean(rr[start:end]) if end > start else 0
+
+    return rr_features
+
+
+def run_beat_segmentation():
+    """Execute the beat segmentation pipeline."""
+    print(f"[BEAT_SEGMENTATION] Starting beat segmentation for: {DATASET_NAME}")
+
+    # Load data
+    signal, r_peaks, metadata = load_preprocessed_and_rpeaks()
+    fs = metadata["fs"]
+
+    # Segment beats
+    beats, valid_peaks = segment_beats(signal, r_peaks, fs)
+
+    # Filter ectopic beats
+    beats, valid_peaks, ectopic_mask = filter_ectopic_beats(beats, valid_peaks, fs)
+
+    # Normalize
+    if NORMALIZE_BEATS:
+        beats = normalize_beats_fn(beats)
+
+    # Compute RR features
+    rr_features = compute_rr_features(valid_peaks, fs)
+    # Trim to match filtered beats
+    rr_features = rr_features[:len(beats)]
+
+    # Save outputs
+    np.save(os.path.join("outputs", "beat_segments.npy"), beats)
+    np.save(os.path.join("outputs", "rr_features.npy"), rr_features)
+    np.save(os.path.join("outputs", "beat_rpeaks.npy"), valid_peaks)
+
+    summary = {
+        "dataset_name": DATASET_NAME,
+        "n_beats": len(beats),
+        "beat_shape": list(beats.shape),
+        "pre_r_ms": PRE_R_MS,
+        "post_r_ms": POST_R_MS,
+        "normalize_beats": NORMALIZE_BEATS,
+        "n_ectopic_removed": int(np.sum(ectopic_mask)),
+        "rr_deviation_threshold": RR_DEVIATION_THRESHOLD,
+    }
+    with open(os.path.join("outputs", "beat_segmentation_summary.json"), "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"[BEAT_SEGMENTATION] Segmentation complete: {beats.shape}")
+    print(f"[BEAT_SEGMENTATION] Summary saved to outputs/")
+
+    return beats, rr_features
+
+
+if __name__ == "__main__":
+    beats, rr_features = run_beat_segmentation()

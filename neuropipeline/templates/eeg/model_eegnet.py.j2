@@ -1,0 +1,241 @@
+"""
+EEG EEGNet Model
+=================
+Dataset: {{ dataset_name }}
+Modality: EEG
+Purpose: Implement EEGNet - a compact CNN architecture specifically designed
+         for EEG-based brain-computer interfaces. Uses depthwise and separable
+         convolutions to efficiently learn spatial and temporal features.
+
+Reference: Lawhern et al. (2018) - EEGNet: A Compact Convolutional Neural
+           Network for EEG-based Brain-Computer Interfaces.
+"""
+
+import os
+import json
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
+
+# Neurophysiological rationale:
+# EEGNet's architecture mirrors the steps of traditional EEG processing:
+# - Temporal conv: learns frequency filters (analogous to bandpass filtering)
+# - Depthwise conv: learns spatial filters (analogous to CSP/beamforming)
+# - Separable conv: learns temporal patterns within spatial maps
+# The compact design (few parameters) prevents overfitting on small EEG datasets
+# (Lawhern et al., 2018).
+
+SEED = 42
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
+# Configuration
+DATASET_NAME = "{{ dataset_name }}"
+N_CHANNELS = {{ n_channels }}  # Number of EEG channels
+N_SAMPLES = {{ n_samples }}  # Number of time samples per epoch
+N_CLASSES = {{ n_classes }}  # Number of output classes
+DROPOUT_RATE = {{ dropout_rate }}
+F1 = {{ F1 }}  # Number of temporal filters
+D = {{ D }}  # Depth multiplier (spatial filters per temporal filter)
+F2 = {{ F2 }}  # Number of pointwise filters (typically F1 * D)
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+os.makedirs("outputs", exist_ok=True)
+
+
+class EEGNet(nn.Module):
+    """EEGNet architecture for EEG classification.
+
+    A compact CNN designed for BCI applications with three main blocks:
+    1. Temporal convolution + Depthwise spatial convolution
+    2. Separable convolution (depthwise + pointwise)
+    3. Classification head
+
+    Input shape: (batch_size, 1, n_channels, n_samples)
+    Output shape: (batch_size, n_classes)
+    """
+
+    def __init__(self, n_channels=N_CHANNELS, n_samples=N_SAMPLES,
+                 n_classes=N_CLASSES, dropout=DROPOUT_RATE,
+                 F1=F1, D=D, F2=F2):
+        super().__init__()
+        self.n_channels = n_channels
+        self.n_samples = n_samples
+
+        # Block 1: Temporal + Spatial filtering
+        # Temporal convolution - learns frequency filters
+        self.conv1 = nn.Conv2d(1, F1, (1, 64), padding=(0, 32), bias=False)
+        self.bn1 = nn.BatchNorm2d(F1)
+        # Depthwise convolution - learns spatial filters (one per temporal filter)
+        self.depthwise = nn.Conv2d(F1, F1 * D, (n_channels, 1), groups=F1, bias=False)
+        self.bn2 = nn.BatchNorm2d(F1 * D)
+        self.pool1 = nn.AvgPool2d((1, 4))
+        self.drop1 = nn.Dropout(dropout)
+
+        # Block 2: Separable convolution
+        # Depthwise temporal convolution
+        self.separable_depth = nn.Conv2d(F1 * D, F1 * D, (1, 16), padding=(0, 8), groups=F1 * D, bias=False)
+        # Pointwise convolution
+        self.separable_point = nn.Conv2d(F1 * D, F2, (1, 1), bias=False)
+        self.bn3 = nn.BatchNorm2d(F2)
+        self.pool2 = nn.AvgPool2d((1, 8))
+        self.drop2 = nn.Dropout(dropout)
+
+        # Classification head
+        # Calculate flattened size
+        self._flat_size = self._get_flat_size()
+        self.classifier = nn.Linear(self._flat_size, n_classes)
+
+        self._init_weights()
+
+    def _get_flat_size(self):
+        """Compute the flattened feature size after conv blocks."""
+        x = torch.zeros(1, 1, self.n_channels, self.n_samples)
+        x = self.pool1(F.elu(self.bn2(self.depthwise(self.bn1(self.conv1(x))))))
+        x = self.pool2(F.elu(self.bn3(self.separable_point(self.separable_depth(x)))))
+        return x.view(1, -1).size(1)
+
+    def _init_weights(self):
+        """Initialize model weights."""
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.xavier_uniform_(m.weight)
+            elif isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        """Forward pass.
+
+        Parameters
+        ----------
+        x : Tensor
+            Input EEG data (batch, 1, n_channels, n_samples).
+
+        Returns
+        -------
+        Tensor
+            Class logits (batch, n_classes).
+        """
+        # Block 1
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.depthwise(x)
+        x = self.bn2(x)
+        x = F.elu(x)
+        x = self.pool1(x)
+        x = self.drop1(x)
+
+        # Block 2
+        x = self.separable_depth(x)
+        x = self.separable_point(x)
+        x = self.bn3(x)
+        x = F.elu(x)
+        x = self.pool2(x)
+        x = self.drop2(x)
+
+        # Classify
+        x = x.view(x.size(0), -1)
+        x = self.classifier(x)
+        return x
+
+
+def train_eegnet():
+    """Train the EEGNet model."""
+    print(f"[MODEL_EEGNET] Starting EEGNet training for: {DATASET_NAME}")
+    print(f"[MODEL_EEGNET] Config: F1={F1}, D={D}, F2={F2}, Channels={N_CHANNELS}, Samples={N_SAMPLES}")
+
+    # Load data
+    features = np.load(os.path.join("outputs", "selected_features.npy"))
+    labels = np.load(os.path.join("outputs", "selected_labels.npy"))
+
+    # Reshape to (batch, 1, channels, samples) for EEGNet
+    n_samples_total = features.shape[0]
+    # REVIEW: Ensure feature dimensions match expected n_channels x n_samples
+    data = features.reshape(n_samples_total, 1, N_CHANNELS, -1)
+    print(f"[MODEL_EEGNET] Input shape: {data.shape}")
+
+    # Convert to tensors
+    X = torch.tensor(data, dtype=torch.float32)
+    y = torch.tensor(labels, dtype=torch.long)
+
+    # Train/val split
+    n_train = int(0.8 * n_samples_total)
+    indices = np.random.permutation(n_samples_total)
+    train_idx, val_idx = indices[:n_train], indices[n_train:]
+
+    train_dataset = TensorDataset(X[train_idx], y[train_idx])
+    val_dataset = TensorDataset(X[val_idx], y[val_idx])
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
+
+    # Model
+    model = EEGNet().to(DEVICE)
+    print(f"[MODEL_EEGNET] Parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+    # Training setup
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    criterion = nn.CrossEntropyLoss()
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=10, factor=0.5)
+
+    best_val_acc = 0
+    history = {"train_loss": [], "val_loss": [], "train_acc": [], "val_acc": []}
+
+    for epoch in range(100):
+        model.train()
+        train_loss, train_correct, train_total = 0, 0, 0
+        for batch_x, batch_y in train_loader:
+            batch_x, batch_y = batch_x.to(DEVICE), batch_y.to(DEVICE)
+            optimizer.zero_grad()
+            outputs = model(batch_x)
+            loss = criterion(outputs, batch_y)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+            _, predicted = outputs.max(1)
+            train_correct += predicted.eq(batch_y).sum().item()
+            train_total += batch_y.size(0)
+
+        model.eval()
+        val_loss, val_correct, val_total = 0, 0, 0
+        with torch.no_grad():
+            for batch_x, batch_y in val_loader:
+                batch_x, batch_y = batch_x.to(DEVICE), batch_y.to(DEVICE)
+                outputs = model(batch_x)
+                loss = criterion(outputs, batch_y)
+                val_loss += loss.item()
+                _, predicted = outputs.max(1)
+                val_correct += predicted.eq(batch_y).sum().item()
+                val_total += batch_y.size(0)
+
+        train_acc = train_correct / max(train_total, 1)
+        val_acc = val_correct / max(val_total, 1)
+        history["train_loss"].append(train_loss / len(train_loader))
+        history["val_loss"].append(val_loss / max(len(val_loader), 1))
+        history["train_acc"].append(train_acc)
+        history["val_acc"].append(val_acc)
+
+        scheduler.step(val_loss)
+
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            torch.save(model.state_dict(), os.path.join("outputs", "best_eegnet.pth"))
+
+        if (epoch + 1) % 20 == 0:
+            print(f"[MODEL_EEGNET] Epoch {epoch+1}/100 - Val Acc: {val_acc:.4f}")
+
+    print(f"[MODEL_EEGNET] Training complete. Best val accuracy: {best_val_acc:.4f}")
+
+    # Save history
+    with open(os.path.join("outputs", "eegnet_history.json"), "w") as f:
+        json.dump(history, f, indent=2)
+
+    return model, history
+
+
+if __name__ == "__main__":
+    model, history = train_eegnet()

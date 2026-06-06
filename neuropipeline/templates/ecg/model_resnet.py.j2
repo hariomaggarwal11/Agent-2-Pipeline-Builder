@@ -1,0 +1,287 @@
+"""
+ECG 1D ResNet Model
+=====================
+Dataset: {{ dataset_name }}
+Modality: ECG
+Purpose: 1D Residual Network for multi-lead ECG arrhythmia detection.
+         Deep residual learning enables training very deep networks for
+         capturing complex ECG patterns across multiple leads.
+
+Reference: Hannun et al. (2019) - Cardiologist-level arrhythmia detection
+           and classification in ambulatory ECG using a deep neural network;
+           He et al. (2016) - Deep Residual Learning for Image Recognition.
+"""
+
+import os
+import json
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+
+# Neurophysiological rationale:
+# Deep residual networks can learn subtle morphological variations in ECG
+# that distinguish between similar arrhythmia types (e.g., LBBB vs RBBB,
+# various SVT subtypes). Residual connections prevent gradient degradation
+# in deep architectures, enabling the model to capture both local (beat-level)
+# and global (rhythm-level) ECG patterns. Multi-lead processing captures
+# spatial aspects of cardiac electrical activity.
+# (Ribeiro et al., 2020 - Automatic diagnosis of the 12-lead ECG)
+
+SEED = 42
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
+# Configuration
+DATASET_NAME = "{{ dataset_name }}"
+{% if n_classes is defined %}
+N_CLASSES = {{ n_classes }}
+{% else %}
+N_CLASSES = 5
+{% endif %}
+{% if n_leads is defined %}
+N_LEADS = {{ n_leads }}
+{% else %}
+N_LEADS = 12
+{% endif %}
+{% if base_filters is defined %}
+BASE_FILTERS = {{ base_filters }}
+{% else %}
+BASE_FILTERS = 64
+{% endif %}
+{% if kernel_size is defined %}
+KERNEL_SIZE = {{ kernel_size }}
+{% else %}
+KERNEL_SIZE = 15
+{% endif %}
+{% if dropout is defined %}
+DROPOUT = {{ dropout }}
+{% else %}
+DROPOUT = 0.2
+{% endif %}
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+os.makedirs("outputs", exist_ok=True)
+
+
+class ResidualBlock(nn.Module):
+    """1D Residual block with skip connections.
+
+    Two convolutional layers with batch normalization and a skip connection
+    that enables gradient flow in deep networks (He et al., 2016).
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size=KERNEL_SIZE, stride=1, dropout=DROPOUT):
+        super().__init__()
+        padding = kernel_size // 2
+        self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size, stride=stride, padding=padding)
+        self.bn1 = nn.BatchNorm1d(out_channels)
+        self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size, padding=padding)
+        self.bn2 = nn.BatchNorm1d(out_channels)
+        self.dropout = nn.Dropout(dropout)
+        self.relu = nn.ReLU()
+
+        # Skip connection with projection if dimensions change
+        self.skip = nn.Sequential(
+            nn.Conv1d(in_channels, out_channels, 1, stride=stride),
+            nn.BatchNorm1d(out_channels),
+        ) if in_channels != out_channels or stride != 1 else nn.Identity()
+
+    def forward(self, x):
+        """Forward pass with residual connection."""
+        identity = self.skip(x)
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.dropout(out)
+        out = self.bn2(self.conv2(out))
+        out = self.dropout(out)
+        out = self.relu(out + identity)
+        return out
+
+
+class ECGResNet1D(nn.Module):
+    """1D ResNet for ECG arrhythmia classification.
+
+    Architecture:
+    - Initial convolution for input projection
+    - 4 residual stages with increasing filters (64, 128, 256, 512)
+    - Global average pooling
+    - Dense classification head
+
+    Based on the architecture from Ribeiro et al. (2020) adapted for
+    variable-length ECG inputs.
+
+    Input shape: (batch_size, n_leads, signal_length)
+    Output shape: (batch_size, n_classes)
+    """
+
+    def __init__(self, n_leads=N_LEADS, n_classes=N_CLASSES,
+                 base_filters=BASE_FILTERS, dropout=DROPOUT):
+        super().__init__()
+
+        # Initial convolution
+        self.stem = nn.Sequential(
+            nn.Conv1d(n_leads, base_filters, kernel_size=15, padding=7),
+            nn.BatchNorm1d(base_filters),
+            nn.ReLU(),
+            nn.MaxPool1d(2),
+        )
+
+        # Residual stages (increasing depth and filters)
+        self.stage1 = self._make_stage(base_filters, base_filters, n_blocks=2, stride=1, dropout=dropout)
+        self.stage2 = self._make_stage(base_filters, base_filters * 2, n_blocks=2, stride=2, dropout=dropout)
+        self.stage3 = self._make_stage(base_filters * 2, base_filters * 4, n_blocks=2, stride=2, dropout=dropout)
+        self.stage4 = self._make_stage(base_filters * 4, base_filters * 8, n_blocks=2, stride=2, dropout=dropout)
+
+        # Global pooling and classifier
+        self.gap = nn.AdaptiveAvgPool1d(1)
+        self.classifier = nn.Sequential(
+            nn.Linear(base_filters * 8, 256),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(256, n_classes),
+        )
+
+        self._init_weights()
+
+    def _make_stage(self, in_channels, out_channels, n_blocks, stride, dropout):
+        """Create a residual stage with multiple blocks."""
+        layers = [ResidualBlock(in_channels, out_channels, stride=stride, dropout=dropout)]
+        for _ in range(n_blocks - 1):
+            layers.append(ResidualBlock(out_channels, out_channels, dropout=dropout))
+        return nn.Sequential(*layers)
+
+    def _init_weights(self):
+        """Initialize weights using Kaiming initialization."""
+        for m in self.modules():
+            if isinstance(m, nn.Conv1d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+            elif isinstance(m, nn.BatchNorm1d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        """Forward pass through ResNet.
+
+        Parameters
+        ----------
+        x : Tensor
+            Input (batch, n_leads, signal_length).
+
+        Returns
+        -------
+        Tensor
+            Class logits (batch, n_classes).
+        """
+        x = self.stem(x)
+        x = self.stage1(x)
+        x = self.stage2(x)
+        x = self.stage3(x)
+        x = self.stage4(x)
+        x = self.gap(x).squeeze(-1)
+        x = self.classifier(x)
+        return x
+
+
+def train_resnet():
+    """Train the 1D ResNet model."""
+    print(f"[MODEL_RESNET] Starting ResNet training for: {DATASET_NAME}")
+    print(f"[MODEL_RESNET] Config: leads={N_LEADS}, filters={BASE_FILTERS}, classes={N_CLASSES}")
+
+    # Load data
+    features = np.load(os.path.join("outputs", "selected_features.npy"))
+    labels = np.load(os.path.join("outputs", "selected_labels.npy"))
+    print(f"[MODEL_RESNET] Data: {features.shape}")
+
+    # Reshape for CNN
+    n_samples = features.shape[0]
+    data = features.reshape(n_samples, N_LEADS, -1)
+    print(f"[MODEL_RESNET] Input shape: {data.shape}")
+
+    X = torch.tensor(data, dtype=torch.float32)
+    y = torch.tensor(labels, dtype=torch.long)
+
+    # Split
+    n_train = int(0.8 * n_samples)
+    indices = np.random.permutation(n_samples)
+    train_idx, val_idx = indices[:n_train], indices[n_train:]
+
+    train_loader = DataLoader(TensorDataset(X[train_idx], y[train_idx]), batch_size=32, shuffle=True)
+    val_loader = DataLoader(TensorDataset(X[val_idx], y[val_idx]), batch_size=32, shuffle=False)
+
+    # Model
+    model = ECGResNet1D().to(DEVICE)
+    print(f"[MODEL_RESNET] Parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+    # REVIEW: Learning rate warmup recommended for ResNet training
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-2)
+    criterion = nn.CrossEntropyLoss()
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
+
+    best_val_acc = 0
+    patience_counter = 0
+    history = {"train_loss": [], "val_loss": [], "train_acc": [], "val_acc": []}
+
+    for epoch in range(100):
+        model.train()
+        train_loss, train_correct, train_total = 0, 0, 0
+        for batch_x, batch_y in train_loader:
+            batch_x, batch_y = batch_x.to(DEVICE), batch_y.to(DEVICE)
+            optimizer.zero_grad()
+            outputs = model(batch_x)
+            loss = criterion(outputs, batch_y)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            train_loss += loss.item()
+            _, predicted = outputs.max(1)
+            train_correct += predicted.eq(batch_y).sum().item()
+            train_total += batch_y.size(0)
+
+        scheduler.step()
+
+        model.eval()
+        val_loss, val_correct, val_total = 0, 0, 0
+        with torch.no_grad():
+            for batch_x, batch_y in val_loader:
+                batch_x, batch_y = batch_x.to(DEVICE), batch_y.to(DEVICE)
+                outputs = model(batch_x)
+                loss = criterion(outputs, batch_y)
+                val_loss += loss.item()
+                _, predicted = outputs.max(1)
+                val_correct += predicted.eq(batch_y).sum().item()
+                val_total += batch_y.size(0)
+
+        train_acc = train_correct / max(train_total, 1)
+        val_acc = val_correct / max(val_total, 1)
+        history["train_loss"].append(train_loss / len(train_loader))
+        history["val_loss"].append(val_loss / max(len(val_loader), 1))
+        history["train_acc"].append(train_acc)
+        history["val_acc"].append(val_acc)
+
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            patience_counter = 0
+            torch.save(model.state_dict(), os.path.join("outputs", "best_resnet.pth"))
+        else:
+            patience_counter += 1
+            if patience_counter >= 20:
+                print(f"[MODEL_RESNET] Early stopping at epoch {epoch+1}")
+                break
+
+        if (epoch + 1) % 20 == 0:
+            print(f"[MODEL_RESNET] Epoch {epoch+1}/100 - Val Acc: {val_acc:.4f}")
+
+    print(f"[MODEL_RESNET] Training complete. Best val accuracy: {best_val_acc:.4f}")
+    with open(os.path.join("outputs", "resnet_history.json"), "w") as f:
+        json.dump(history, f, indent=2)
+
+    return model, history
+
+
+if __name__ == "__main__":
+    model, history = train_resnet()

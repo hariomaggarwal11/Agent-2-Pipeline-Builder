@@ -1,0 +1,305 @@
+"""
+ECG Evaluation Stage
+=====================
+Dataset: {{ dataset_name }}
+Modality: ECG
+Purpose: Evaluate ECG classification model with clinical metrics including
+         sensitivity, specificity, positive predictive value (PPV), negative
+         predictive value (NPV), and AHA/IEC compliance metrics.
+
+Clinical evaluation ensures the model meets medical device standards for
+ECG interpretation systems.
+"""
+
+import os
+import json
+import numpy as np
+from sklearn.model_selection import KFold, StratifiedKFold
+from sklearn.metrics import (
+    accuracy_score, f1_score, precision_score, recall_score,
+    roc_auc_score, confusion_matrix, classification_report, roc_curve
+)
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Neurophysiological rationale:
+# ECG classification evaluation must go beyond standard ML metrics to include
+# clinically meaningful measures. The AHA recommends reporting:
+# - Sensitivity (Se): ability to detect true positives (e.g., VT detection)
+# - Positive predictive value (PPV/+P): precision of detections
+# - Per-class performance for each arrhythmia type
+# (ANSI/AAMI EC57:2012 - Testing and reporting performance results of
+#  cardiac rhythm and ST segment measurement algorithms)
+
+SEED = 42
+np.random.seed(SEED)
+
+# Configuration
+DATASET_NAME = "{{ dataset_name }}"
+{% if cv_strategy is defined %}
+CV_STRATEGY = "{{ cv_strategy }}"
+{% else %}
+CV_STRATEGY = "stratified_kfold"
+{% endif %}
+{% if k_folds is defined %}
+K_FOLDS = {{ k_folds }}
+{% else %}
+K_FOLDS = 5
+{% endif %}
+{% if metrics_list is defined %}
+METRICS_LIST = {{ metrics_list }}
+{% else %}
+METRICS_LIST = ["accuracy", "f1", "sensitivity", "specificity", "ppv", "npv", "auc_roc"]
+{% endif %}
+
+os.makedirs("outputs", exist_ok=True)
+
+
+def load_data():
+    """Load features and labels."""
+    print("[EVALUATION] Loading data...")
+    features = np.load(os.path.join("outputs", "selected_features.npy"))
+    labels = np.load(os.path.join("outputs", "selected_labels.npy"))
+    print(f"[EVALUATION] Data: {features.shape}, Classes: {np.unique(labels)}")
+    return features, labels
+
+
+def compute_clinical_metrics(y_true, y_pred, y_prob=None):
+    """Compute clinical ECG evaluation metrics.
+
+    Clinical metrics per class follow AAMI EC57 recommendations for
+    automated ECG analysis systems.
+
+    Parameters
+    ----------
+    y_true : np.ndarray
+        True labels.
+    y_pred : np.ndarray
+        Predicted labels.
+    y_prob : np.ndarray, optional
+        Class probabilities.
+
+    Returns
+    -------
+    dict
+        Clinical metrics including Se, Sp, PPV, NPV per class.
+    """
+    print("[EVALUATION] Computing clinical metrics...")
+    classes = np.unique(y_true)
+    n_classes = len(classes)
+    cm = confusion_matrix(y_true, y_pred, labels=classes)
+
+    metrics = {
+        "overall": {
+            "accuracy": float(accuracy_score(y_true, y_pred)),
+            "f1_weighted": float(f1_score(y_true, y_pred, average="weighted")),
+            "f1_macro": float(f1_score(y_true, y_pred, average="macro")),
+        },
+        "per_class": {},
+    }
+
+    for i, cls in enumerate(classes):
+        tp = cm[i, i]
+        fn = np.sum(cm[i, :]) - tp
+        fp = np.sum(cm[:, i]) - tp
+        tn = np.sum(cm) - tp - fn - fp
+
+        sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+        ppv = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        npv = tn / (tn + fn) if (tn + fn) > 0 else 0.0
+
+        metrics["per_class"][str(cls)] = {
+            "sensitivity": float(sensitivity),
+            "specificity": float(specificity),
+            "ppv": float(ppv),
+            "npv": float(npv),
+            "tp": int(tp),
+            "fp": int(fp),
+            "fn": int(fn),
+            "tn": int(tn),
+        }
+
+    # Average clinical metrics
+    sensitivities = [v["sensitivity"] for v in metrics["per_class"].values()]
+    specificities = [v["specificity"] for v in metrics["per_class"].values()]
+    ppvs = [v["ppv"] for v in metrics["per_class"].values()]
+    npvs = [v["npv"] for v in metrics["per_class"].values()]
+
+    metrics["overall"]["mean_sensitivity"] = float(np.mean(sensitivities))
+    metrics["overall"]["mean_specificity"] = float(np.mean(specificities))
+    metrics["overall"]["mean_ppv"] = float(np.mean(ppvs))
+    metrics["overall"]["mean_npv"] = float(np.mean(npvs))
+
+    # AUC-ROC
+    if y_prob is not None and n_classes == 2:
+        metrics["overall"]["auc_roc"] = float(roc_auc_score(y_true, y_prob[:, 1]))
+
+    return metrics
+
+
+def run_cross_validation(features, labels):
+    """Run cross-validated evaluation.
+
+    Parameters
+    ----------
+    features : np.ndarray
+        Feature matrix.
+    labels : np.ndarray
+        Target labels.
+
+    Returns
+    -------
+    tuple
+        (fold_results, predictions, probabilities)
+    """
+    from sklearn.ensemble import RandomForestClassifier
+    print(f"[EVALUATION] Running {CV_STRATEGY} cross-validation (k={K_FOLDS})...")
+
+    cv = StratifiedKFold(n_splits=K_FOLDS, shuffle=True, random_state=SEED)
+    all_predictions = np.zeros_like(labels)
+    n_classes = len(np.unique(labels))
+    all_probabilities = np.zeros((len(labels), n_classes))
+    fold_results = []
+
+    for fold_idx, (train_idx, test_idx) in enumerate(cv.split(features, labels)):
+        X_train, X_test = features[train_idx], features[test_idx]
+        y_train, y_test = labels[train_idx], labels[test_idx]
+
+        clf = RandomForestClassifier(n_estimators=200, random_state=SEED, class_weight="balanced")
+        clf.fit(X_train, y_train)
+        y_pred = clf.predict(X_test)
+        y_prob = clf.predict_proba(X_test)
+
+        all_predictions[test_idx] = y_pred
+        all_probabilities[test_idx, :y_prob.shape[1]] = y_prob
+
+        fold_metrics = compute_clinical_metrics(y_test, y_pred, y_prob)
+        fold_results.append(fold_metrics)
+        print(f"[EVALUATION] Fold {fold_idx+1}/{K_FOLDS} - "
+              f"Acc: {fold_metrics['overall']['accuracy']:.4f}, "
+              f"Se: {fold_metrics['overall']['mean_sensitivity']:.4f}")
+
+    return fold_results, all_predictions, all_probabilities
+
+
+def plot_confusion_matrix(y_true, y_pred):
+    """Plot confusion matrix with clinical annotations."""
+    print("[EVALUATION] Generating confusion matrix...")
+    cm = confusion_matrix(y_true, y_pred)
+    classes = np.unique(y_true)
+
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+                xticklabels=classes, yticklabels=classes)
+    plt.xlabel("Predicted")
+    plt.ylabel("True")
+    plt.title(f"Confusion Matrix - {DATASET_NAME}\n(ECG Arrhythmia Classification)")
+    plt.tight_layout()
+    plt.savefig(os.path.join("outputs", "confusion_matrix.png"), dpi=150)
+    plt.close()
+
+
+def plot_clinical_metrics_summary(metrics):
+    """Plot per-class clinical metrics bar chart."""
+    print("[EVALUATION] Generating clinical metrics plot...")
+    classes = list(metrics["per_class"].keys())
+    se = [metrics["per_class"][c]["sensitivity"] for c in classes]
+    sp = [metrics["per_class"][c]["specificity"] for c in classes]
+    ppv = [metrics["per_class"][c]["ppv"] for c in classes]
+
+    x = np.arange(len(classes))
+    width = 0.25
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.bar(x - width, se, width, label="Sensitivity", color="steelblue")
+    ax.bar(x, sp, width, label="Specificity", color="lightcoral")
+    ax.bar(x + width, ppv, width, label="PPV", color="mediumseagreen")
+
+    ax.set_xlabel("Class")
+    ax.set_ylabel("Score")
+    ax.set_title(f"Clinical Metrics per Class - {DATASET_NAME}")
+    ax.set_xticks(x)
+    ax.set_xticklabels(classes, rotation=45)
+    ax.legend()
+    ax.set_ylim(0, 1.1)
+    plt.tight_layout()
+    plt.savefig(os.path.join("outputs", "clinical_metrics.png"), dpi=150)
+    plt.close()
+
+
+def plot_roc_curves(y_true, y_prob):
+    """Plot ROC curves per class."""
+    print("[EVALUATION] Generating ROC curves...")
+    from sklearn.preprocessing import label_binarize
+    classes = np.unique(y_true)
+    n_classes = len(classes)
+
+    plt.figure(figsize=(8, 6))
+    if n_classes == 2:
+        fpr, tpr, _ = roc_curve(y_true, y_prob[:, 1])
+        auc_val = roc_auc_score(y_true, y_prob[:, 1])
+        plt.plot(fpr, tpr, label=f"AUC = {auc_val:.3f}")
+    else:
+        y_bin = label_binarize(y_true, classes=classes)
+        for i, cls in enumerate(classes):
+            if y_bin[:, i].sum() > 0:
+                fpr, tpr, _ = roc_curve(y_bin[:, i], y_prob[:, i])
+                plt.plot(fpr, tpr, label=f"Class {cls}")
+
+    plt.plot([0, 1], [0, 1], "k--")
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate (Sensitivity)")
+    plt.title(f"ROC Curves - {DATASET_NAME}")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join("outputs", "roc_curves.png"), dpi=150)
+    plt.close()
+
+
+def run_evaluation():
+    """Execute the complete ECG evaluation pipeline."""
+    print(f"[EVALUATION] Starting ECG evaluation for: {DATASET_NAME}")
+
+    # Load data
+    features, labels = load_data()
+
+    # Cross-validation
+    fold_results, predictions, probabilities = run_cross_validation(features, labels)
+
+    # Overall clinical metrics
+    overall_metrics = compute_clinical_metrics(labels, predictions, probabilities)
+
+    # Print summary
+    print(f"\n[EVALUATION] === Clinical Performance Summary ===")
+    print(f"[EVALUATION] Accuracy: {overall_metrics['overall']['accuracy']:.4f}")
+    print(f"[EVALUATION] Mean Sensitivity: {overall_metrics['overall']['mean_sensitivity']:.4f}")
+    print(f"[EVALUATION] Mean Specificity: {overall_metrics['overall']['mean_specificity']:.4f}")
+    print(f"[EVALUATION] Mean PPV: {overall_metrics['overall']['mean_ppv']:.4f}")
+    print(f"[EVALUATION] Mean NPV: {overall_metrics['overall']['mean_npv']:.4f}")
+
+    # Plots
+    plot_confusion_matrix(labels, predictions)
+    plot_clinical_metrics_summary(overall_metrics)
+    plot_roc_curves(labels, probabilities)
+
+    # Save results
+    results = {
+        "dataset_name": DATASET_NAME,
+        "cv_strategy": CV_STRATEGY,
+        "k_folds": K_FOLDS,
+        "overall_metrics": overall_metrics["overall"],
+        "per_class_metrics": overall_metrics["per_class"],
+        "fold_results": [fr["overall"] for fr in fold_results],
+    }
+    with open(os.path.join("outputs", "evaluation_results.json"), "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"[EVALUATION] Results saved to outputs/evaluation_results.json")
+
+    return results
+
+
+if __name__ == "__main__":
+    results = run_evaluation()

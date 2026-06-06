@@ -1,0 +1,270 @@
+"""
+EEG Quality Check Stage
+========================
+Dataset: {{ dataset_name }}
+Modality: EEG
+Purpose: Load Agent 1 inspection report, load raw EEG data, and evaluate
+         signal quality gates including flat channel detection, line noise
+         assessment, and overall quality scoring.
+
+This stage ensures that only data meeting minimum quality standards proceeds
+through the pipeline, reducing the risk of spurious results from noisy or
+corrupted recordings.
+"""
+
+import os
+import json
+import numpy as np
+
+# Neurophysiological rationale:
+# EEG signals are susceptible to multiple artifact sources including
+# electrode impedance drift (flat channels), power line interference
+# (50/60 Hz line noise), and movement artifacts. Quality gating at the
+# start of the pipeline prevents propagation of unreliable data through
+# subsequent analysis stages (Jas et al., 2017 - Autoreject).
+
+# REVIEW: Quality threshold of {{ quality_threshold }} may need adjustment
+# depending on dataset-specific noise characteristics.
+
+SEED = 42
+np.random.seed(SEED)
+
+# Configuration
+DATASET_NAME = "{{ dataset_name }}"
+DATA_FORMAT = "{{ format }}"
+QUALITY_SCORE = {{ quality_score }}
+FILEPATH = "{{ filepath }}"
+QUALITY_THRESHOLD = {{ quality_threshold }}
+FAIL_ON_FLAT = {{ fail_on_flat }}
+FAIL_ON_LINE_NOISE = {{ fail_on_line_noise }}
+
+# Create outputs directory
+os.makedirs("outputs", exist_ok=True)
+
+
+def load_agent1_report(report_path):
+    """Load and parse the Agent 1 inspection report.
+
+    Parameters
+    ----------
+    report_path : str
+        Path to the Agent 1 JSON report.
+
+    Returns
+    -------
+    dict
+        Parsed report with quality metrics.
+    """
+    print("[QUALITY_CHECK] Loading Agent 1 inspection report...")
+    if os.path.exists(report_path):
+        with open(report_path, "r") as f:
+            report = json.load(f)
+        print(f"[QUALITY_CHECK] Report loaded - quality score: {report.get('quality_score', {}).get('score', 'N/A')}")
+        return report
+    else:
+        print("[QUALITY_CHECK] WARNING: Agent 1 report not found, proceeding with raw assessment")
+        return {}
+
+
+def load_raw_eeg(filepath):
+    """Load raw EEG data using MNE-Python.
+
+    Parameters
+    ----------
+    filepath : str
+        Path to the EEG data file.
+
+    Returns
+    -------
+    mne.io.Raw
+        Raw EEG data object.
+    """
+    import mne
+    print(f"[QUALITY_CHECK] Loading raw EEG from: {filepath}")
+    # Reference: Gramfort et al. (2013) - MNE software for processing MEG and EEG data
+    raw = mne.io.{{ mne_reader }}(filepath, preload=True)
+    print(f"[QUALITY_CHECK] Data loaded: {raw.info['nchan']} channels, {raw.n_times / raw.info['sfreq']:.1f}s duration")
+    return raw
+
+
+def detect_flat_channels(raw, threshold_seconds=5.0):
+    """Detect flat (zero-variance) channels.
+
+    Flat channels indicate electrode disconnection or hardware failure.
+    These channels carry no neural information and must be excluded
+    (Bigdely-Shamlo et al., 2015 - PREP pipeline).
+
+    Parameters
+    ----------
+    raw : mne.io.Raw
+        Raw EEG data.
+    threshold_seconds : float
+        Minimum duration of zero-variance to flag as flat.
+
+    Returns
+    -------
+    list
+        Names of detected flat channels.
+    """
+    print("[QUALITY_CHECK] Detecting flat channels...")
+    data = raw.get_data()
+    sfreq = raw.info["sfreq"]
+    window_samples = int(threshold_seconds * sfreq)
+    flat_channels = []
+
+    for idx, ch_name in enumerate(raw.ch_names):
+        ch_data = data[idx]
+        # Check for consecutive zero-variance segments
+        for start in range(0, len(ch_data) - window_samples, window_samples):
+            segment = ch_data[start:start + window_samples]
+            if np.std(segment) < 1e-10:
+                flat_channels.append(ch_name)
+                break
+
+    print(f"[QUALITY_CHECK] Flat channels detected: {len(flat_channels)} - {flat_channels}")
+    return flat_channels
+
+
+def detect_line_noise(raw, freq=50.0, threshold_db=20.0):
+    """Detect excessive power line noise.
+
+    Power line interference (50 Hz Europe/Asia, 60 Hz Americas) creates
+    narrowband artifacts that can dominate spectral features if not
+    addressed (Mitra & Bokil, 2008 - Observed Brain Dynamics).
+
+    Parameters
+    ----------
+    raw : mne.io.Raw
+        Raw EEG data.
+    freq : float
+        Expected line noise frequency (50 or 60 Hz).
+    threshold_db : float
+        Maximum acceptable line noise power in dB above baseline.
+
+    Returns
+    -------
+    dict
+        Line noise assessment per channel.
+    """
+    from scipy.signal import welch
+    print(f"[QUALITY_CHECK] Assessing line noise at {freq} Hz...")
+    data = raw.get_data()
+    sfreq = raw.info["sfreq"]
+    noise_report = {}
+
+    for idx, ch_name in enumerate(raw.ch_names):
+        freqs, psd = welch(data[idx], fs=sfreq, nperseg=int(sfreq * 2))
+        # Find power at line frequency
+        line_idx = np.argmin(np.abs(freqs - freq))
+        # Compare to neighboring frequencies
+        neighbor_idxs = [i for i in range(max(0, line_idx - 5), min(len(freqs), line_idx + 6)) if i != line_idx]
+        baseline_power = np.mean(psd[neighbor_idxs])
+        line_power = psd[line_idx]
+        ratio_db = 10 * np.log10(line_power / (baseline_power + 1e-30))
+        noise_report[ch_name] = {
+            "line_power_db": float(ratio_db),
+            "exceeds_threshold": ratio_db > threshold_db,
+        }
+
+    noisy_count = sum(1 for v in noise_report.values() if v["exceeds_threshold"])
+    print(f"[QUALITY_CHECK] Channels with excessive line noise: {noisy_count}/{len(raw.ch_names)}")
+    return noise_report
+
+
+def compute_quality_score(raw, flat_channels, noise_report):
+    """Compute overall signal quality score (0-100).
+
+    Parameters
+    ----------
+    raw : mne.io.Raw
+        Raw EEG data.
+    flat_channels : list
+        Detected flat channels.
+    noise_report : dict
+        Line noise assessment.
+
+    Returns
+    -------
+    float
+        Quality score between 0 and 100.
+    """
+    n_channels = len(raw.ch_names)
+    # Penalize for flat channels
+    flat_penalty = (len(flat_channels) / n_channels) * 40
+    # Penalize for noisy channels
+    noisy_count = sum(1 for v in noise_report.values() if v["exceeds_threshold"])
+    noise_penalty = (noisy_count / n_channels) * 30
+    # Base score from Agent 1
+    base_score = QUALITY_SCORE
+    score = max(0, base_score - flat_penalty - noise_penalty)
+    return round(score, 2)
+
+
+def run_quality_check():
+    """Execute the complete quality check pipeline."""
+    print(f"[QUALITY_CHECK] Starting quality assessment for dataset: {DATASET_NAME}")
+    print(f"[QUALITY_CHECK] Quality threshold: {QUALITY_THRESHOLD}")
+
+    # Load Agent 1 report if available
+    report_path = os.path.join("outputs", "agent1_report.json")
+    agent1_report = load_agent1_report(report_path)
+
+    # Load raw EEG
+    raw = load_raw_eeg(FILEPATH)
+
+    # Run quality gates
+    flat_channels = detect_flat_channels(raw)
+    noise_report = detect_line_noise(raw)
+    quality_score = compute_quality_score(raw, flat_channels, noise_report)
+
+    print(f"[QUALITY_CHECK] Computed quality score: {quality_score}")
+
+    # Apply failure criteria
+    passed = True
+    reasons = []
+
+    if quality_score < QUALITY_THRESHOLD:
+        passed = False
+        reasons.append(f"Quality score {quality_score} below threshold {QUALITY_THRESHOLD}")
+
+    if FAIL_ON_FLAT and len(flat_channels) > 0:
+        # REVIEW: Consider allowing up to 10% flat channels for high-density arrays
+        passed = False
+        reasons.append(f"Flat channels detected: {flat_channels}")
+
+    if FAIL_ON_LINE_NOISE:
+        noisy_pct = sum(1 for v in noise_report.values() if v["exceeds_threshold"]) / len(noise_report) * 100
+        if noisy_pct > 50:
+            passed = False
+            reasons.append(f"Excessive line noise in {noisy_pct:.0f}% of channels")
+
+    # Save quality report
+    quality_report = {
+        "dataset_name": DATASET_NAME,
+        "format": DATA_FORMAT,
+        "quality_score": quality_score,
+        "quality_threshold": QUALITY_THRESHOLD,
+        "passed": passed,
+        "flat_channels": flat_channels,
+        "noise_report": {k: v["line_power_db"] for k, v in noise_report.items()},
+        "failure_reasons": reasons,
+        "n_channels": len(raw.ch_names),
+        "duration_seconds": float(raw.n_times / raw.info["sfreq"]),
+        "sampling_rate": raw.info["sfreq"],
+    }
+
+    output_path = os.path.join("outputs", "quality_report.json")
+    with open(output_path, "w") as f:
+        json.dump(quality_report, f, indent=2)
+    print(f"[QUALITY_CHECK] Report saved to: {output_path}")
+
+    if passed:
+        print("[QUALITY_CHECK] PASSED - Data meets quality requirements")
+    else:
+        print(f"[QUALITY_CHECK] FAILED - Reasons: {reasons}")
+
+    return quality_report
+
+
+if __name__ == "__main__":
+    result = run_quality_check()

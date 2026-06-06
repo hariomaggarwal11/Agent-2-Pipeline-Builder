@@ -1,0 +1,449 @@
+"""
+ECG Feature Extraction Stage
+==============================
+Dataset: {{ dataset_name }}
+Modality: ECG
+Purpose: Extract {{ feature_domain }} features from ECG data including
+         HRV (time/frequency/nonlinear) and morphological features for
+         cardiac rhythm classification.
+
+Comprehensive ECG features capture both temporal dynamics (HRV) and
+waveform characteristics (morphology) for robust classification.
+"""
+
+import os
+import json
+import numpy as np
+from scipy import signal as scipy_signal
+from scipy.stats import entropy
+
+# Neurophysiological rationale:
+# ECG features span multiple domains:
+# - Time-domain HRV: SDNN, RMSSD, pNN50 reflect autonomic modulation
+#   (Task Force, 1996 - Heart rate variability standards)
+# - Frequency-domain HRV: LF/HF ratio indicates sympathovagal balance
+# - Nonlinear HRV: SD1/SD2 capture complexity of cardiac regulation
+# - Morphological: QRS width, ST elevation, T-wave features for arrhythmia
+#   (de Chazal et al., 2004; Acharya et al., 2017)
+
+SEED = 42
+np.random.seed(SEED)
+
+# Configuration
+DATASET_NAME = "{{ dataset_name }}"
+FEATURE_DOMAIN = "{{ feature_domain }}"  # time, frequency, nonlinear, morphological, all
+{% if time_features is defined %}
+TIME_FEATURES = {{ time_features }}  # e.g., ["SDNN", "RMSSD", "pNN50", "mean_hr"]
+{% else %}
+TIME_FEATURES = ["SDNN", "RMSSD", "pNN50", "mean_hr", "SDSD"]
+{% endif %}
+{% if freq_features is defined %}
+FREQ_FEATURES = {{ freq_features }}  # e.g., ["VLF", "LF", "HF", "LF_HF_ratio"]
+{% else %}
+FREQ_FEATURES = ["VLF", "LF", "HF", "LF_HF_ratio", "total_power"]
+{% endif %}
+{% if nonlinear_features is defined %}
+NONLINEAR_FEATURES = {{ nonlinear_features }}  # e.g., ["SD1", "SD2", "SampEn", "DFA_alpha1"]
+{% else %}
+NONLINEAR_FEATURES = ["SD1", "SD2", "SampEn", "DFA_alpha1"]
+{% endif %}
+{% if morphological_features is defined %}
+MORPHOLOGICAL_FEATURES = {{ morphological_features }}  # e.g., ["qrs_duration", "st_level", "t_amp"]
+{% else %}
+MORPHOLOGICAL_FEATURES = ["qrs_duration", "r_amplitude", "t_amplitude", "pr_interval", "qt_interval"]
+{% endif %}
+
+os.makedirs("outputs", exist_ok=True)
+
+
+def load_data():
+    """Load beat segments and R-peak data.
+
+    Returns
+    -------
+    tuple
+        (beats, r_peaks, rr_features, metadata)
+    """
+    print("[FEATURE_EXTRACTION] Loading data...")
+    beats = np.load(os.path.join("outputs", "beat_segments.npy"))
+    r_peaks = np.load(os.path.join("outputs", "beat_rpeaks.npy"))
+    rr_features = np.load(os.path.join("outputs", "rr_features.npy"))
+    with open(os.path.join("outputs", "preprocessed_metadata.json"), "r") as f:
+        metadata = json.load(f)
+    print(f"[FEATURE_EXTRACTION] Beats: {beats.shape}, fs={metadata['fs']}")
+    return beats, r_peaks, rr_features, metadata
+
+
+def extract_time_domain_hrv(r_peaks, fs):
+    """Extract time-domain HRV features.
+
+    Time-domain measures reflect overall HRV magnitude and short-term
+    variability. RMSSD and pNN50 primarily reflect parasympathetic
+    (vagal) modulation (Task Force, 1996).
+
+    Parameters
+    ----------
+    r_peaks : np.ndarray
+        R-peak indices.
+    fs : float
+        Sampling frequency.
+
+    Returns
+    -------
+    dict
+        Time-domain HRV features.
+    """
+    print("[FEATURE_EXTRACTION] Extracting time-domain HRV features...")
+    rr_ms = np.diff(r_peaks) / fs * 1000  # RR intervals in ms
+    nn_diff = np.diff(rr_ms)  # Successive differences
+
+    features = {}
+    if "SDNN" in TIME_FEATURES:
+        features["SDNN"] = np.std(rr_ms, ddof=1)
+    if "RMSSD" in TIME_FEATURES:
+        features["RMSSD"] = np.sqrt(np.mean(nn_diff ** 2))
+    if "pNN50" in TIME_FEATURES:
+        features["pNN50"] = np.sum(np.abs(nn_diff) > 50) / len(nn_diff) * 100
+    if "mean_hr" in TIME_FEATURES:
+        features["mean_hr"] = 60000 / np.mean(rr_ms)
+    if "SDSD" in TIME_FEATURES:
+        features["SDSD"] = np.std(nn_diff, ddof=1)
+    if "mean_rr" in TIME_FEATURES:
+        features["mean_rr"] = np.mean(rr_ms)
+    if "cv_rr" in TIME_FEATURES:
+        features["cv_rr"] = np.std(rr_ms) / np.mean(rr_ms) * 100
+
+    print(f"[FEATURE_EXTRACTION] Time-domain: {len(features)} features")
+    return features
+
+
+def extract_frequency_domain_hrv(r_peaks, fs):
+    """Extract frequency-domain HRV features.
+
+    Frequency analysis of RR intervals reveals distinct spectral components:
+    - VLF (0.003-0.04 Hz): thermoregulation, hormonal
+    - LF (0.04-0.15 Hz): mixed sympathetic and parasympathetic
+    - HF (0.15-0.4 Hz): parasympathetic (respiratory sinus arrhythmia)
+    (Malliani et al., 1991; Task Force, 1996)
+
+    Parameters
+    ----------
+    r_peaks : np.ndarray
+        R-peak indices.
+    fs : float
+        Sampling frequency.
+
+    Returns
+    -------
+    dict
+        Frequency-domain HRV features.
+    """
+    print("[FEATURE_EXTRACTION] Extracting frequency-domain HRV features...")
+    rr_ms = np.diff(r_peaks) / fs * 1000
+    rr_s = rr_ms / 1000
+
+    # Interpolate RR intervals for uniform sampling (4 Hz)
+    rr_times = np.cumsum(rr_s)
+    interp_fs = 4.0
+    interp_times = np.arange(rr_times[0], rr_times[-1], 1.0 / interp_fs)
+    rr_interp = np.interp(interp_times, rr_times, rr_s)
+    rr_interp = rr_interp - np.mean(rr_interp)  # Detrend
+
+    # Welch PSD
+    freqs, psd = scipy_signal.welch(rr_interp, fs=interp_fs, nperseg=min(256, len(rr_interp)))
+
+    features = {}
+    # Band power integration
+    vlf_mask = (freqs >= 0.003) & (freqs < 0.04)
+    lf_mask = (freqs >= 0.04) & (freqs < 0.15)
+    hf_mask = (freqs >= 0.15) & (freqs <= 0.4)
+
+    if "VLF" in FREQ_FEATURES:
+        features["VLF"] = np.trapz(psd[vlf_mask], freqs[vlf_mask])
+    if "LF" in FREQ_FEATURES:
+        features["LF"] = np.trapz(psd[lf_mask], freqs[lf_mask])
+    if "HF" in FREQ_FEATURES:
+        features["HF"] = np.trapz(psd[hf_mask], freqs[hf_mask])
+    if "LF_HF_ratio" in FREQ_FEATURES:
+        lf_power = np.trapz(psd[lf_mask], freqs[lf_mask])
+        hf_power = np.trapz(psd[hf_mask], freqs[hf_mask])
+        features["LF_HF_ratio"] = lf_power / (hf_power + 1e-10)
+    if "total_power" in FREQ_FEATURES:
+        features["total_power"] = np.trapz(psd, freqs)
+
+    print(f"[FEATURE_EXTRACTION] Frequency-domain: {len(features)} features")
+    return features
+
+
+def extract_nonlinear_hrv(r_peaks, fs):
+    """Extract nonlinear HRV features.
+
+    Nonlinear measures capture the complexity and fractal-like nature
+    of cardiac regulation that linear statistics miss:
+    - SD1/SD2 (Poincare plot): short/long-term variability
+    - Sample Entropy: signal complexity/regularity
+    - DFA alpha1: fractal scaling exponent
+    (Brennan et al., 2001; Richman & Moorman, 2000)
+
+    Parameters
+    ----------
+    r_peaks : np.ndarray
+        R-peak indices.
+    fs : float
+        Sampling frequency.
+
+    Returns
+    -------
+    dict
+        Nonlinear HRV features.
+    """
+    print("[FEATURE_EXTRACTION] Extracting nonlinear HRV features...")
+    rr_ms = np.diff(r_peaks) / fs * 1000
+
+    features = {}
+
+    if "SD1" in NONLINEAR_FEATURES or "SD2" in NONLINEAR_FEATURES:
+        # Poincare plot analysis
+        rr_n = rr_ms[:-1]
+        rr_n1 = rr_ms[1:]
+        sd1 = np.std(rr_n1 - rr_n) / np.sqrt(2)
+        sd2 = np.std(rr_n1 + rr_n) / np.sqrt(2)
+        if "SD1" in NONLINEAR_FEATURES:
+            features["SD1"] = sd1
+        if "SD2" in NONLINEAR_FEATURES:
+            features["SD2"] = sd2
+
+    if "SampEn" in NONLINEAR_FEATURES:
+        # Sample Entropy (m=2, r=0.2*std)
+        features["SampEn"] = _sample_entropy(rr_ms, m=2, r=0.2 * np.std(rr_ms))
+
+    if "DFA_alpha1" in NONLINEAR_FEATURES:
+        # Detrended Fluctuation Analysis (short-term: 4-16 beats)
+        features["DFA_alpha1"] = _dfa(rr_ms, n_min=4, n_max=16)
+
+    print(f"[FEATURE_EXTRACTION] Nonlinear: {len(features)} features")
+    return features
+
+
+def _sample_entropy(data, m=2, r=None):
+    """Compute sample entropy.
+
+    Parameters
+    ----------
+    data : np.ndarray
+        Input time series.
+    m : int
+        Embedding dimension.
+    r : float
+        Tolerance (typically 0.2 * std).
+
+    Returns
+    -------
+    float
+        Sample entropy value.
+    """
+    if r is None:
+        r = 0.2 * np.std(data)
+    N = len(data)
+    if N < m + 2:
+        return 0.0
+
+    def count_matches(template_len):
+        count = 0
+        templates = np.array([data[i:i + template_len] for i in range(N - template_len)])
+        for i in range(len(templates)):
+            dist = np.max(np.abs(templates[i] - templates), axis=1)
+            count += np.sum(dist < r) - 1  # Exclude self-match
+        return count
+
+    A = count_matches(m + 1)
+    B = count_matches(m)
+    if B == 0:
+        return 0.0
+    return -np.log(A / B + 1e-10)
+
+
+def _dfa(data, n_min=4, n_max=16):
+    """Detrended Fluctuation Analysis (short-term alpha1).
+
+    Parameters
+    ----------
+    data : np.ndarray
+        RR interval time series.
+    n_min : int
+        Minimum box size.
+    n_max : int
+        Maximum box size.
+
+    Returns
+    -------
+    float
+        DFA alpha1 scaling exponent.
+    """
+    N = len(data)
+    if N < n_max * 2:
+        return 0.0
+
+    integrated = np.cumsum(data - np.mean(data))
+    box_sizes = np.arange(n_min, n_max + 1)
+    fluctuations = []
+
+    for n in box_sizes:
+        n_boxes = N // n
+        if n_boxes < 2:
+            continue
+        rms_values = []
+        for i in range(n_boxes):
+            segment = integrated[i * n:(i + 1) * n]
+            x = np.arange(n)
+            coeffs = np.polyfit(x, segment, 1)
+            trend = np.polyval(coeffs, x)
+            rms_values.append(np.sqrt(np.mean((segment - trend) ** 2)))
+        fluctuations.append(np.mean(rms_values))
+
+    if len(fluctuations) < 2:
+        return 0.0
+
+    log_n = np.log(box_sizes[:len(fluctuations)])
+    log_f = np.log(np.array(fluctuations) + 1e-10)
+    alpha = np.polyfit(log_n, log_f, 1)[0]
+    return alpha
+
+
+def extract_morphological_features(beats, fs):
+    """Extract morphological features from beat waveforms.
+
+    Morphological features capture the shape of the PQRST complex,
+    essential for detecting structural abnormalities (bundle branch blocks,
+    ST-elevation MI, long QT syndrome) (Lyon et al., 2018).
+
+    Parameters
+    ----------
+    beats : np.ndarray
+        Beat segments (n_beats, n_leads, window_samples).
+    fs : float
+        Sampling frequency.
+
+    Returns
+    -------
+    np.ndarray
+        Morphological features per beat (n_beats, n_features).
+    """
+    print("[FEATURE_EXTRACTION] Extracting morphological features...")
+    n_beats = beats.shape[0]
+    features_list = []
+
+    for beat_idx in range(n_beats):
+        beat = beats[beat_idx, 0, :]  # Use primary lead
+        beat_features = {}
+
+        if "r_amplitude" in MORPHOLOGICAL_FEATURES:
+            beat_features["r_amplitude"] = float(np.max(beat))
+
+        if "qrs_duration" in MORPHOLOGICAL_FEATURES:
+            # Estimate QRS duration using energy threshold
+            energy = beat ** 2
+            threshold = 0.3 * np.max(energy)
+            above_threshold = np.where(energy > threshold)[0]
+            if len(above_threshold) > 1:
+                qrs_samples = above_threshold[-1] - above_threshold[0]
+                beat_features["qrs_duration"] = qrs_samples / fs * 1000  # ms
+            else:
+                beat_features["qrs_duration"] = 0.0
+
+        if "t_amplitude" in MORPHOLOGICAL_FEATURES:
+            # T-wave is typically in the latter half of the beat
+            mid = len(beat) // 2
+            t_region = beat[mid:]
+            beat_features["t_amplitude"] = float(np.max(t_region))
+
+        if "pr_interval" in MORPHOLOGICAL_FEATURES:
+            # Simplified PR interval estimation
+            r_idx = np.argmax(beat)
+            beat_features["pr_interval"] = r_idx / fs * 1000  # ms from start to R
+
+        if "qt_interval" in MORPHOLOGICAL_FEATURES:
+            # Simplified QT: from QRS onset to T-wave end
+            beat_features["qt_interval"] = len(beat) * 0.7 / fs * 1000  # ms
+
+        features_list.append(list(beat_features.values()))
+
+    morph_features = np.array(features_list)
+    print(f"[FEATURE_EXTRACTION] Morphological features: {morph_features.shape}")
+    return morph_features
+
+
+def run_feature_extraction():
+    """Execute the ECG feature extraction pipeline."""
+    print(f"[FEATURE_EXTRACTION] Starting feature extraction for: {DATASET_NAME}")
+    print(f"[FEATURE_EXTRACTION] Feature domain: {FEATURE_DOMAIN}")
+
+    # Load data
+    beats, r_peaks, rr_features, metadata = load_data()
+    fs = metadata["fs"]
+
+    all_features = {}
+    feature_arrays = []
+
+    {% if feature_domain == "time" or feature_domain == "all" %}
+    # Time-domain HRV
+    time_feats = extract_time_domain_hrv(r_peaks, fs)
+    all_features["time_domain"] = time_feats
+    feature_arrays.append(np.array(list(time_feats.values())))
+    {% endif %}
+
+    {% if feature_domain == "frequency" or feature_domain == "all" %}
+    # Frequency-domain HRV
+    freq_feats = extract_frequency_domain_hrv(r_peaks, fs)
+    all_features["frequency_domain"] = freq_feats
+    feature_arrays.append(np.array(list(freq_feats.values())))
+    {% endif %}
+
+    {% if feature_domain == "nonlinear" or feature_domain == "all" %}
+    # Nonlinear HRV
+    nonlinear_feats = extract_nonlinear_hrv(r_peaks, fs)
+    all_features["nonlinear"] = nonlinear_feats
+    feature_arrays.append(np.array(list(nonlinear_feats.values())))
+    {% endif %}
+
+    {% if feature_domain == "morphological" or feature_domain == "all" %}
+    # Morphological features (per-beat)
+    morph_feats = extract_morphological_features(beats, fs)
+    feature_arrays.append(morph_feats.mean(axis=0))  # Average across beats for global features
+    {% endif %}
+
+    # Combine features
+    # For per-beat classification, use beat-level features
+    if beats.shape[0] > 0:
+        morph = extract_morphological_features(beats, fs)
+        # Broadcast global HRV features to each beat
+        global_feats = np.concatenate(feature_arrays) if feature_arrays else np.array([])
+        n_beats = morph.shape[0]
+        global_repeated = np.tile(global_feats, (n_beats, 1))
+        combined = np.concatenate([morph, global_repeated, rr_features[:n_beats]], axis=1)
+    else:
+        combined = np.concatenate(feature_arrays).reshape(1, -1)
+
+    # Handle NaN/Inf
+    combined = np.nan_to_num(combined, nan=0.0, posinf=0.0, neginf=0.0)
+
+    print(f"[FEATURE_EXTRACTION] Final feature matrix: {combined.shape}")
+
+    # Save
+    np.save(os.path.join("outputs", "features.npy"), combined)
+    summary = {
+        "dataset_name": DATASET_NAME,
+        "feature_domain": FEATURE_DOMAIN,
+        "n_samples": combined.shape[0],
+        "n_features": combined.shape[1],
+        "hrv_features": all_features,
+    }
+    with open(os.path.join("outputs", "feature_extraction_summary.json"), "w") as f:
+        json.dump(summary, f, indent=2, default=str)
+    print(f"[FEATURE_EXTRACTION] Features saved to outputs/")
+
+    return combined
+
+
+if __name__ == "__main__":
+    features = run_feature_extraction()

@@ -1,0 +1,354 @@
+"""
+EEG Feature Extraction Stage
+==============================
+Dataset: {{ dataset_name }}
+Modality: EEG
+Purpose: Extract {{ feature_type }} features from epoched EEG data including
+         band power (Welch PSD), connectivity metrics (PLV/WPLI),
+         and frontal alpha asymmetry (FAA) for downstream classification.
+
+Feature extraction transforms raw time-series into informative representations
+that capture neural dynamics relevant to the classification task.
+"""
+
+import os
+import json
+import numpy as np
+from scipy import signal
+from scipy.stats import kurtosis, skew
+
+# Neurophysiological rationale:
+# EEG features capture distinct aspects of brain dynamics:
+# - Band power (delta through gamma) reflects oscillatory activity linked to
+#   cognitive states (Klimesch, 1999; Buzsaki & Draguhn, 2004)
+# - Phase-Locking Value (PLV) quantifies functional connectivity between
+#   brain regions (Lachaux et al., 1999)
+# - Frontal Alpha Asymmetry (FAA) is a biomarker for emotional valence
+#   (Davidson, 1992; Coan & Allen, 2004)
+
+SEED = 42
+np.random.seed(SEED)
+
+# Configuration
+DATASET_NAME = "{{ dataset_name }}"
+FEATURE_TYPE = "{{ feature_type }}"  # temporal, spectral, connectivity, combined
+BANDS = {{ bands }}  # e.g., {"delta": [0.5,4], "theta": [4,8], "alpha": [8,13], "beta": [13,30], "gamma": [30,45]}
+METHOD = "{{ method }}"  # welch, multitaper
+{% if connectivity_metric is defined %}
+CONNECTIVITY_METRIC = "{{ connectivity_metric }}"  # PLV, WPLI, coherence
+{% endif %}
+{% if include_faa is defined %}
+INCLUDE_FAA = {{ include_faa }}
+{% endif %}
+
+os.makedirs("outputs", exist_ok=True)
+
+
+def load_epochs():
+    """Load epoched EEG data from previous stage.
+
+    Returns
+    -------
+    tuple
+        (data, labels) numpy arrays.
+    """
+    print("[FEATURE_EXTRACTION] Loading epoched data...")
+    data = np.load(os.path.join("outputs", "epochs_data.npy"))
+    labels = np.load(os.path.join("outputs", "epochs_labels.npy"))
+    print(f"[FEATURE_EXTRACTION] Data shape: {data.shape} (epochs, channels, timepoints)")
+    return data, labels
+
+
+def extract_band_power(data, sfreq=128.0):
+    """Extract spectral band power features using {{ method }}.
+
+    Band power quantifies the amplitude of oscillatory activity in canonical
+    frequency bands. Welch's method provides a robust PSD estimate by
+    averaging over overlapping segments (Welch, 1967).
+
+    Parameters
+    ----------
+    data : np.ndarray
+        Epoched EEG data (n_epochs, n_channels, n_times).
+    sfreq : float
+        Sampling frequency in Hz.
+
+    Returns
+    -------
+    np.ndarray
+        Band power features (n_epochs, n_channels * n_bands).
+    """
+    print("[FEATURE_EXTRACTION] Extracting band power features...")
+    n_epochs, n_channels, n_times = data.shape
+    n_bands = len(BANDS)
+    features = np.zeros((n_epochs, n_channels * n_bands))
+
+    for epoch_idx in range(n_epochs):
+        feat_idx = 0
+        for ch_idx in range(n_channels):
+            {% if method == "welch" %}
+            # Welch PSD estimation
+            freqs, psd = signal.welch(data[epoch_idx, ch_idx], fs=sfreq, nperseg=min(256, n_times))
+            {% elif method == "multitaper" %}
+            # Multitaper PSD (better frequency resolution, reduced variance)
+            freqs, psd = signal.welch(data[epoch_idx, ch_idx], fs=sfreq, nperseg=min(256, n_times), window="dpss")
+            {% else %}
+            freqs, psd = signal.welch(data[epoch_idx, ch_idx], fs=sfreq, nperseg=min(256, n_times))
+            {% endif %}
+
+            for band_name, (fmin, fmax) in BANDS.items():
+                band_mask = (freqs >= fmin) & (freqs <= fmax)
+                # Log band power (dB) - more normally distributed
+                band_power = np.log10(np.mean(psd[band_mask]) + 1e-10)
+                features[epoch_idx, feat_idx] = band_power
+                feat_idx += 1
+
+    print(f"[FEATURE_EXTRACTION] Band power features: {features.shape}")
+    return features
+
+
+def extract_temporal_features(data):
+    """Extract time-domain statistical features.
+
+    Temporal features capture non-oscillatory signal properties including
+    variance, zero-crossings, and higher-order statistics that reflect
+    signal complexity (Hjorth, 1970 - Hjorth parameters).
+
+    Parameters
+    ----------
+    data : np.ndarray
+        Epoched EEG data.
+
+    Returns
+    -------
+    np.ndarray
+        Temporal features (n_epochs, n_channels * n_features).
+    """
+    print("[FEATURE_EXTRACTION] Extracting temporal features...")
+    n_epochs, n_channels, n_times = data.shape
+    n_feats_per_ch = 7  # mean, var, std, skewness, kurtosis, zero_crossings, rms
+
+    features = np.zeros((n_epochs, n_channels * n_feats_per_ch))
+
+    for epoch_idx in range(n_epochs):
+        feat_idx = 0
+        for ch_idx in range(n_channels):
+            ch_data = data[epoch_idx, ch_idx]
+            features[epoch_idx, feat_idx] = np.mean(ch_data)
+            features[epoch_idx, feat_idx + 1] = np.var(ch_data)
+            features[epoch_idx, feat_idx + 2] = np.std(ch_data)
+            features[epoch_idx, feat_idx + 3] = skew(ch_data)
+            features[epoch_idx, feat_idx + 4] = kurtosis(ch_data)
+            features[epoch_idx, feat_idx + 5] = np.sum(np.diff(np.sign(ch_data)) != 0)
+            features[epoch_idx, feat_idx + 6] = np.sqrt(np.mean(ch_data ** 2))
+            feat_idx += n_feats_per_ch
+
+    print(f"[FEATURE_EXTRACTION] Temporal features: {features.shape}")
+    return features
+
+
+{% if connectivity_metric is defined %}
+def extract_connectivity_features(data, sfreq=128.0):
+    """Extract functional connectivity features ({{ connectivity_metric }}).
+
+    Phase-based connectivity measures quantify the consistency of phase
+    relationships between channels, reflecting neural communication
+    (Lachaux et al., 1999 - PLV; Vinck et al., 2011 - WPLI).
+
+    Parameters
+    ----------
+    data : np.ndarray
+        Epoched EEG data.
+    sfreq : float
+        Sampling frequency.
+
+    Returns
+    -------
+    np.ndarray
+        Connectivity features (n_epochs, n_pairs).
+    """
+    from scipy.signal import hilbert
+    print(f"[FEATURE_EXTRACTION] Extracting connectivity features ({CONNECTIVITY_METRIC})...")
+    n_epochs, n_channels, n_times = data.shape
+    n_pairs = n_channels * (n_channels - 1) // 2
+
+    # REVIEW: Connectivity computation can be slow for high-density arrays
+    features = np.zeros((n_epochs, n_pairs))
+
+    for epoch_idx in range(n_epochs):
+        pair_idx = 0
+        for i in range(n_channels):
+            for j in range(i + 1, n_channels):
+                if CONNECTIVITY_METRIC == "PLV":
+                    # Phase Locking Value
+                    phase_i = np.angle(hilbert(data[epoch_idx, i]))
+                    phase_j = np.angle(hilbert(data[epoch_idx, j]))
+                    plv = np.abs(np.mean(np.exp(1j * (phase_i - phase_j))))
+                    features[epoch_idx, pair_idx] = plv
+                elif CONNECTIVITY_METRIC == "WPLI":
+                    # Weighted Phase Lag Index
+                    phase_i = np.angle(hilbert(data[epoch_idx, i]))
+                    phase_j = np.angle(hilbert(data[epoch_idx, j]))
+                    phase_diff = phase_i - phase_j
+                    imag_part = np.sin(phase_diff)
+                    wpli = np.abs(np.mean(np.abs(imag_part) * np.sign(imag_part))) / np.mean(np.abs(imag_part) + 1e-10)
+                    features[epoch_idx, pair_idx] = wpli
+                elif CONNECTIVITY_METRIC == "coherence":
+                    f, coh = signal.coherence(data[epoch_idx, i], data[epoch_idx, j], fs=sfreq)
+                    features[epoch_idx, pair_idx] = np.mean(coh)
+                pair_idx += 1
+
+    print(f"[FEATURE_EXTRACTION] Connectivity features: {features.shape}")
+    return features
+{% endif %}
+
+
+{% if include_faa is defined and include_faa %}
+def extract_faa(data, sfreq=128.0, ch_names=None):
+    """Extract Frontal Alpha Asymmetry (FAA).
+
+    FAA = log(alpha_right) - log(alpha_left) reflects approach/withdrawal
+    motivation and emotional valence. Positive FAA indicates greater left
+    frontal activity (approach motivation) (Davidson, 1992; Coan & Allen, 2004).
+
+    Parameters
+    ----------
+    data : np.ndarray
+        Epoched EEG data.
+    sfreq : float
+        Sampling frequency.
+    ch_names : list, optional
+        Channel names for identifying frontal pairs.
+
+    Returns
+    -------
+    np.ndarray
+        FAA features (n_epochs, n_pairs).
+    """
+    print("[FEATURE_EXTRACTION] Computing Frontal Alpha Asymmetry...")
+    n_epochs = data.shape[0]
+    alpha_band = BANDS.get("alpha", [8, 13])
+
+    # Define frontal pairs (standard 10-20 system)
+    frontal_pairs = [
+        ("F3", "F4"),
+        ("F7", "F8"),
+        ("AF3", "AF4"),
+        ("Fp1", "Fp2"),
+    ]
+
+    if ch_names is None:
+        # Use first few channel pairs as proxy
+        n_channels = data.shape[1]
+        n_pairs = min(4, n_channels // 2)
+        faa_features = np.zeros((n_epochs, n_pairs))
+        for epoch_idx in range(n_epochs):
+            for pair_idx in range(n_pairs):
+                left_idx = pair_idx * 2
+                right_idx = pair_idx * 2 + 1
+                freqs, psd_left = signal.welch(data[epoch_idx, left_idx], fs=sfreq, nperseg=min(256, data.shape[2]))
+                freqs, psd_right = signal.welch(data[epoch_idx, right_idx], fs=sfreq, nperseg=min(256, data.shape[2]))
+                alpha_mask = (freqs >= alpha_band[0]) & (freqs <= alpha_band[1])
+                alpha_left = np.log(np.mean(psd_left[alpha_mask]) + 1e-10)
+                alpha_right = np.log(np.mean(psd_right[alpha_mask]) + 1e-10)
+                faa_features[epoch_idx, pair_idx] = alpha_right - alpha_left
+    else:
+        available_pairs = [(l, r) for l, r in frontal_pairs if l in ch_names and r in ch_names]
+        faa_features = np.zeros((n_epochs, max(1, len(available_pairs))))
+        for epoch_idx in range(n_epochs):
+            for pair_idx, (left_ch, right_ch) in enumerate(available_pairs):
+                left_idx = ch_names.index(left_ch)
+                right_idx = ch_names.index(right_ch)
+                freqs, psd_left = signal.welch(data[epoch_idx, left_idx], fs=sfreq, nperseg=min(256, data.shape[2]))
+                freqs, psd_right = signal.welch(data[epoch_idx, right_idx], fs=sfreq, nperseg=min(256, data.shape[2]))
+                alpha_mask = (freqs >= alpha_band[0]) & (freqs <= alpha_band[1])
+                alpha_left = np.log(np.mean(psd_left[alpha_mask]) + 1e-10)
+                alpha_right = np.log(np.mean(psd_right[alpha_mask]) + 1e-10)
+                faa_features[epoch_idx, pair_idx] = alpha_right - alpha_left
+
+    print(f"[FEATURE_EXTRACTION] FAA features: {faa_features.shape}")
+    return faa_features
+{% endif %}
+
+
+def run_feature_extraction():
+    """Execute the feature extraction pipeline."""
+    print(f"[FEATURE_EXTRACTION] Starting feature extraction for: {DATASET_NAME}")
+    print(f"[FEATURE_EXTRACTION] Feature type: {FEATURE_TYPE}")
+
+    # Load epoched data
+    data, labels = load_epochs()
+
+    feature_sets = []
+    feature_names = []
+
+    {% if feature_type == "spectral" or feature_type == "combined" %}
+    # Spectral (band power) features
+    band_features = extract_band_power(data)
+    feature_sets.append(band_features)
+    feature_names.append("spectral")
+    {% endif %}
+
+    {% if feature_type == "temporal" or feature_type == "combined" %}
+    # Temporal features
+    temporal_features = extract_temporal_features(data)
+    feature_sets.append(temporal_features)
+    feature_names.append("temporal")
+    {% endif %}
+
+    {% if connectivity_metric is defined %}
+    {% if feature_type == "connectivity" or feature_type == "combined" %}
+    # Connectivity features
+    conn_features = extract_connectivity_features(data)
+    feature_sets.append(conn_features)
+    feature_names.append("connectivity")
+    {% endif %}
+    {% endif %}
+
+    {% if include_faa is defined and include_faa %}
+    # Frontal Alpha Asymmetry
+    faa_features = extract_faa(data)
+    feature_sets.append(faa_features)
+    feature_names.append("faa")
+    {% endif %}
+
+    # Concatenate all feature sets
+    if feature_sets:
+        all_features = np.concatenate(feature_sets, axis=1)
+    else:
+        # Default: extract band power
+        all_features = extract_band_power(data)
+        feature_names.append("spectral")
+
+    print(f"[FEATURE_EXTRACTION] Final feature matrix: {all_features.shape}")
+
+    # Handle NaN/Inf values
+    all_features = np.nan_to_num(all_features, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Save features
+    features_path = os.path.join("outputs", "features.npy")
+    labels_path = os.path.join("outputs", "feature_labels.npy")
+    np.save(features_path, all_features)
+    np.save(labels_path, labels)
+    print(f"[FEATURE_EXTRACTION] Features saved: {features_path}")
+
+    # Save feature extraction summary
+    summary = {
+        "dataset_name": DATASET_NAME,
+        "feature_type": FEATURE_TYPE,
+        "feature_sets": feature_names,
+        "n_epochs": all_features.shape[0],
+        "n_features": all_features.shape[1],
+        "bands": BANDS,
+        "method": METHOD,
+    }
+    summary_path = os.path.join("outputs", "feature_extraction_summary.json")
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"[FEATURE_EXTRACTION] Summary saved: {summary_path}")
+
+    return all_features, labels
+
+
+if __name__ == "__main__":
+    features, labels = run_feature_extraction()

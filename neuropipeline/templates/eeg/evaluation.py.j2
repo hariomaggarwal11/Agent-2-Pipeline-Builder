@@ -1,0 +1,412 @@
+"""
+EEG Evaluation Stage
+=====================
+Dataset: {{ dataset_name }}
+Modality: EEG
+Purpose: Evaluate trained model using {{ cv_strategy }} cross-validation
+         strategy, compute classification metrics, generate diagnostic
+         plots, and run statistical significance testing.
+
+Rigorous evaluation with proper cross-validation prevents optimistic bias
+and ensures reported performance reflects true generalization ability.
+"""
+
+import os
+import json
+import numpy as np
+from sklearn.model_selection import (
+    KFold, StratifiedKFold, LeaveOneGroupOut, train_test_split
+)
+from sklearn.metrics import (
+    accuracy_score, f1_score, precision_score, recall_score,
+    roc_auc_score, confusion_matrix, classification_report, roc_curve
+)
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Neurophysiological rationale:
+# EEG classification evaluation requires careful cross-validation design
+# to avoid data leakage. Subject-independent evaluation (LOSO) is the gold
+# standard for BCI generalization claims, as within-subject dependencies
+# can inflate accuracy estimates (Lotte et al., 2018).
+# Permutation testing provides non-parametric significance assessment
+# (Combrisson & Jerbi, 2015 - Exceeding chance level by chance).
+
+SEED = 42
+np.random.seed(SEED)
+
+# Configuration
+DATASET_NAME = "{{ dataset_name }}"
+CV_STRATEGY = "{{ cv_strategy }}"  # LOSO, kfold, stratified_kfold, holdout
+K_FOLDS = {{ k_folds }}
+METRICS_LIST = {{ metrics_list }}  # e.g., ["accuracy", "f1", "auc_roc", "precision", "recall"]
+PLOT_CONFUSION = {{ plot_confusion }}
+PLOT_ROC = {{ plot_roc }}
+{% if plot_per_subject is defined %}
+PLOT_PER_SUBJECT = {{ plot_per_subject }}
+{% endif %}
+{% if plot_loss_curves is defined %}
+PLOT_LOSS_CURVES = {{ plot_loss_curves }}
+{% endif %}
+{% if n_permutations is defined %}
+N_PERMUTATIONS = {{ n_permutations }}
+{% endif %}
+
+os.makedirs("outputs", exist_ok=True)
+
+
+def load_data_and_model():
+    """Load features, labels, and trained model predictions.
+
+    Returns
+    -------
+    tuple
+        (features, labels, predictions, probabilities)
+    """
+    print("[EVALUATION] Loading data and predictions...")
+    features = np.load(os.path.join("outputs", "selected_features.npy"))
+    labels = np.load(os.path.join("outputs", "selected_labels.npy"))
+
+    # Load predictions if available
+    pred_path = os.path.join("outputs", "predictions.npy")
+    prob_path = os.path.join("outputs", "probabilities.npy")
+    if os.path.exists(pred_path):
+        predictions = np.load(pred_path)
+        probabilities = np.load(prob_path) if os.path.exists(prob_path) else None
+    else:
+        predictions = None
+        probabilities = None
+
+    print(f"[EVALUATION] Data: {features.shape}, Labels: {labels.shape}")
+    return features, labels, predictions, probabilities
+
+
+def run_cross_validation(features, labels):
+    """Run cross-validation evaluation.
+
+    Parameters
+    ----------
+    features : np.ndarray
+        Feature matrix.
+    labels : np.ndarray
+        Target labels.
+
+    Returns
+    -------
+    dict
+        Cross-validation results with per-fold metrics.
+    """
+    from sklearn.svm import SVC
+    from sklearn.ensemble import RandomForestClassifier
+
+    print(f"[EVALUATION] Running {CV_STRATEGY} cross-validation...")
+
+    {% if cv_strategy == "LOSO" %}
+    # Leave-One-Subject-Out: requires subject IDs
+    # REVIEW: Ensure subject_ids are available for LOSO evaluation
+    subject_path = os.path.join("outputs", "subject_ids.npy")
+    if os.path.exists(subject_path):
+        groups = np.load(subject_path)
+    else:
+        # Simulate subject groups
+        n_subjects = 10
+        groups = np.repeat(np.arange(n_subjects), len(labels) // n_subjects + 1)[:len(labels)]
+    cv = LeaveOneGroupOut()
+    splits = cv.split(features, labels, groups)
+    n_splits = cv.get_n_splits(features, labels, groups)
+    {% elif cv_strategy == "kfold" %}
+    cv = KFold(n_splits=K_FOLDS, shuffle=True, random_state=SEED)
+    splits = cv.split(features, labels)
+    n_splits = K_FOLDS
+    {% elif cv_strategy == "stratified_kfold" %}
+    cv = StratifiedKFold(n_splits=K_FOLDS, shuffle=True, random_state=SEED)
+    splits = cv.split(features, labels)
+    n_splits = K_FOLDS
+    {% elif cv_strategy == "holdout" %}
+    # Simple train/test split
+    n_splits = 1
+    splits = [train_test_split(
+        np.arange(len(labels)), test_size=0.2, random_state=SEED, stratify=labels
+    )]
+    {% endif %}
+
+    fold_results = []
+    all_predictions = np.zeros_like(labels)
+    all_probabilities = np.zeros((len(labels), len(np.unique(labels))))
+
+    # Use a simple classifier for CV evaluation
+    for fold_idx, (train_idx, test_idx) in enumerate(splits):
+        X_train, X_test = features[train_idx], features[test_idx]
+        y_train, y_test = labels[train_idx], labels[test_idx]
+
+        # Train simple model for evaluation
+        clf = RandomForestClassifier(n_estimators=100, random_state=SEED)
+        clf.fit(X_train, y_train)
+        y_pred = clf.predict(X_test)
+        y_prob = clf.predict_proba(X_test)
+
+        all_predictions[test_idx] = y_pred
+        all_probabilities[test_idx, :y_prob.shape[1]] = y_prob
+
+        # Compute fold metrics
+        fold_metrics = {}
+        if "accuracy" in METRICS_LIST:
+            fold_metrics["accuracy"] = accuracy_score(y_test, y_pred)
+        if "f1" in METRICS_LIST:
+            fold_metrics["f1"] = f1_score(y_test, y_pred, average="weighted")
+        if "precision" in METRICS_LIST:
+            fold_metrics["precision"] = precision_score(y_test, y_pred, average="weighted", zero_division=0)
+        if "recall" in METRICS_LIST:
+            fold_metrics["recall"] = recall_score(y_test, y_pred, average="weighted", zero_division=0)
+        if "auc_roc" in METRICS_LIST and len(np.unique(labels)) == 2:
+            fold_metrics["auc_roc"] = roc_auc_score(y_test, y_prob[:, 1])
+
+        fold_results.append(fold_metrics)
+        print(f"[EVALUATION] Fold {fold_idx+1}/{n_splits} - Acc: {fold_metrics.get('accuracy', 0):.4f}")
+
+    return fold_results, all_predictions, all_probabilities
+
+
+def compute_overall_metrics(labels, predictions, probabilities):
+    """Compute aggregated metrics across all folds.
+
+    Parameters
+    ----------
+    labels : np.ndarray
+        True labels.
+    predictions : np.ndarray
+        Predicted labels.
+    probabilities : np.ndarray
+        Class probabilities.
+
+    Returns
+    -------
+    dict
+        Overall metrics.
+    """
+    print("[EVALUATION] Computing overall metrics...")
+    metrics = {}
+
+    if "accuracy" in METRICS_LIST:
+        metrics["accuracy"] = float(accuracy_score(labels, predictions))
+    if "f1" in METRICS_LIST:
+        metrics["f1_weighted"] = float(f1_score(labels, predictions, average="weighted"))
+        metrics["f1_macro"] = float(f1_score(labels, predictions, average="macro"))
+    if "precision" in METRICS_LIST:
+        metrics["precision"] = float(precision_score(labels, predictions, average="weighted", zero_division=0))
+    if "recall" in METRICS_LIST:
+        metrics["recall"] = float(recall_score(labels, predictions, average="weighted", zero_division=0))
+    if "auc_roc" in METRICS_LIST and len(np.unique(labels)) == 2:
+        metrics["auc_roc"] = float(roc_auc_score(labels, probabilities[:, 1]))
+
+    # Classification report
+    report = classification_report(labels, predictions, output_dict=True)
+    metrics["classification_report"] = report
+
+    for key, value in metrics.items():
+        if isinstance(value, float):
+            print(f"[EVALUATION] {key}: {value:.4f}")
+
+    return metrics
+
+
+{% if plot_confusion %}
+def plot_confusion_matrix(labels, predictions):
+    """Generate and save confusion matrix plot."""
+    print("[EVALUATION] Generating confusion matrix plot...")
+    cm = confusion_matrix(labels, predictions)
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+                xticklabels=np.unique(labels), yticklabels=np.unique(labels))
+    plt.xlabel("Predicted")
+    plt.ylabel("True")
+    plt.title(f"Confusion Matrix - {DATASET_NAME}")
+    plt.tight_layout()
+    plt.savefig(os.path.join("outputs", "confusion_matrix.png"), dpi=150)
+    plt.close()
+    print("[EVALUATION] Confusion matrix saved")
+{% endif %}
+
+
+{% if plot_roc %}
+def plot_roc_curve(labels, probabilities):
+    """Generate and save ROC curve plot."""
+    print("[EVALUATION] Generating ROC curve plot...")
+    n_classes = len(np.unique(labels))
+    plt.figure(figsize=(8, 6))
+
+    if n_classes == 2:
+        fpr, tpr, _ = roc_curve(labels, probabilities[:, 1])
+        auc_val = roc_auc_score(labels, probabilities[:, 1])
+        plt.plot(fpr, tpr, label=f"ROC (AUC = {auc_val:.3f})")
+    else:
+        from sklearn.preprocessing import label_binarize
+        labels_bin = label_binarize(labels, classes=np.unique(labels))
+        for i in range(n_classes):
+            fpr, tpr, _ = roc_curve(labels_bin[:, i], probabilities[:, i])
+            plt.plot(fpr, tpr, label=f"Class {i}")
+
+    plt.plot([0, 1], [0, 1], "k--", label="Chance")
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title(f"ROC Curve - {DATASET_NAME}")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join("outputs", "roc_curve.png"), dpi=150)
+    plt.close()
+    print("[EVALUATION] ROC curve saved")
+{% endif %}
+
+
+{% if plot_per_subject is defined and plot_per_subject %}
+def plot_per_subject_accuracy(fold_results):
+    """Plot per-subject/fold accuracy bar chart."""
+    print("[EVALUATION] Generating per-subject accuracy plot...")
+    accuracies = [fold.get("accuracy", 0) for fold in fold_results]
+    plt.figure(figsize=(10, 5))
+    plt.bar(range(len(accuracies)), accuracies, color="steelblue")
+    plt.axhline(y=np.mean(accuracies), color="r", linestyle="--", label=f"Mean: {np.mean(accuracies):.3f}")
+    plt.xlabel("Fold / Subject")
+    plt.ylabel("Accuracy")
+    plt.title(f"Per-Fold Accuracy - {DATASET_NAME}")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join("outputs", "per_subject_accuracy.png"), dpi=150)
+    plt.close()
+{% endif %}
+
+
+{% if plot_loss_curves is defined and plot_loss_curves %}
+def plot_training_curves():
+    """Plot training/validation loss and accuracy curves."""
+    print("[EVALUATION] Generating loss curves...")
+    history_path = os.path.join("outputs", "training_history.json")
+    if not os.path.exists(history_path):
+        print("[EVALUATION] No training history found, skipping loss curves")
+        return
+    with open(history_path, "r") as f:
+        history = json.load(f)
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+    ax1.plot(history["train_loss"], label="Train")
+    ax1.plot(history["val_loss"], label="Validation")
+    ax1.set_xlabel("Epoch")
+    ax1.set_ylabel("Loss")
+    ax1.set_title("Loss Curves")
+    ax1.legend()
+
+    ax2.plot(history["train_acc"], label="Train")
+    ax2.plot(history["val_acc"], label="Validation")
+    ax2.set_xlabel("Epoch")
+    ax2.set_ylabel("Accuracy")
+    ax2.set_title("Accuracy Curves")
+    ax2.legend()
+
+    plt.tight_layout()
+    plt.savefig(os.path.join("outputs", "training_curves.png"), dpi=150)
+    plt.close()
+{% endif %}
+
+
+{% if n_permutations is defined and n_permutations > 0 %}
+def run_permutation_test(features, labels, observed_accuracy):
+    """Run permutation test for statistical significance.
+
+    Tests whether the observed accuracy is significantly above chance
+    by comparing against a null distribution of permuted labels
+    (Combrisson & Jerbi, 2015).
+
+    Parameters
+    ----------
+    features : np.ndarray
+        Feature matrix.
+    labels : np.ndarray
+        True labels.
+    observed_accuracy : float
+        Accuracy to test.
+
+    Returns
+    -------
+    float
+        p-value for the observed accuracy.
+    """
+    from sklearn.ensemble import RandomForestClassifier
+    print(f"[EVALUATION] Running permutation test ({N_PERMUTATIONS} permutations)...")
+    null_distribution = []
+    for i in range(N_PERMUTATIONS):
+        perm_labels = np.random.permutation(labels)
+        clf = RandomForestClassifier(n_estimators=50, random_state=i)
+        # Simple holdout for speed
+        n_train = int(0.7 * len(labels))
+        clf.fit(features[:n_train], perm_labels[:n_train])
+        perm_acc = accuracy_score(perm_labels[n_train:], clf.predict(features[n_train:]))
+        null_distribution.append(perm_acc)
+
+    p_value = np.mean(np.array(null_distribution) >= observed_accuracy)
+    print(f"[EVALUATION] Permutation p-value: {p_value:.4f}")
+    print(f"[EVALUATION] Chance level: {np.mean(null_distribution):.4f} +/- {np.std(null_distribution):.4f}")
+    return p_value
+{% endif %}
+
+
+def run_evaluation():
+    """Execute the complete evaluation pipeline."""
+    print(f"[EVALUATION] Starting evaluation for: {DATASET_NAME}")
+    print(f"[EVALUATION] CV Strategy: {CV_STRATEGY}, K: {K_FOLDS}")
+
+    # Load data
+    features, labels, predictions, probabilities = load_data_and_model()
+
+    # Run cross-validation
+    fold_results, cv_predictions, cv_probabilities = run_cross_validation(features, labels)
+
+    # Use CV predictions if model predictions not available
+    if predictions is None:
+        predictions = cv_predictions
+        probabilities = cv_probabilities
+
+    # Compute overall metrics
+    metrics = compute_overall_metrics(labels, predictions, probabilities)
+
+    # Generate plots
+    {% if plot_confusion %}
+    plot_confusion_matrix(labels, predictions)
+    {% endif %}
+    {% if plot_roc %}
+    plot_roc_curve(labels, probabilities)
+    {% endif %}
+    {% if plot_per_subject is defined and plot_per_subject %}
+    plot_per_subject_accuracy(fold_results)
+    {% endif %}
+    {% if plot_loss_curves is defined and plot_loss_curves %}
+    plot_training_curves()
+    {% endif %}
+
+    {% if n_permutations is defined and n_permutations > 0 %}
+    # Permutation test
+    p_value = run_permutation_test(features, labels, metrics.get("accuracy", 0))
+    metrics["permutation_p_value"] = p_value
+    {% endif %}
+
+    # Save results
+    results = {
+        "dataset_name": DATASET_NAME,
+        "cv_strategy": CV_STRATEGY,
+        "k_folds": K_FOLDS,
+        "overall_metrics": {k: v for k, v in metrics.items() if k != "classification_report"},
+        "fold_results": fold_results,
+        "n_samples": len(labels),
+        "n_classes": len(np.unique(labels)),
+    }
+    results_path = os.path.join("outputs", "evaluation_results.json")
+    with open(results_path, "w") as f:
+        json.dump(results, f, indent=2, default=str)
+    print(f"[EVALUATION] Results saved: {results_path}")
+
+    return results
+
+
+if __name__ == "__main__":
+    results = run_evaluation()

@@ -1,0 +1,336 @@
+"""
+ECG Preprocessing Stage
+========================
+Dataset: {{ dataset_name }}
+Modality: ECG
+Purpose: Apply ECG-specific preprocessing including bandpass filtering,
+         baseline wander correction, amplitude normalization, wavelet/
+         Savitzky-Golay denoising, lead selection, and optional resampling.
+
+Preprocessing removes artifacts while preserving diagnostically relevant
+ECG morphological features (P-wave, QRS complex, T-wave, ST segment).
+"""
+
+import os
+import json
+import numpy as np
+from scipy.signal import butter, filtfilt, iirnotch, savgol_filter
+
+# Neurophysiological rationale:
+# ECG preprocessing must preserve morphological features critical for
+# clinical interpretation: P-wave (atrial depolarization), QRS complex
+# (ventricular depolarization), and T-wave (ventricular repolarization).
+# Overly aggressive filtering can distort ST-segment morphology, leading
+# to false positive ischemia detection (Luo & Johnston, 2010).
+# AHA recommends 0.05-150 Hz bandwidth for diagnostic ECG.
+
+SEED = 42
+np.random.seed(SEED)
+
+# Configuration
+DATASET_NAME = "{{ dataset_name }}"
+{% if hp_freq is defined %}
+HP_FREQ = {{ hp_freq }}  # High-pass cutoff (Hz) - removes baseline wander
+{% else %}
+HP_FREQ = 0.5
+{% endif %}
+{% if lp_freq is defined %}
+LP_FREQ = {{ lp_freq }}  # Low-pass cutoff (Hz) - removes high-freq noise
+{% else %}
+LP_FREQ = 40.0
+{% endif %}
+{% if notch_freq is defined %}
+NOTCH_FREQ = {{ notch_freq }}  # Power line frequency
+{% else %}
+NOTCH_FREQ = 50
+{% endif %}
+{% if normalize_method is defined %}
+NORMALIZE_METHOD = "{{ normalize_method }}"  # zscore, minmax, none
+{% else %}
+NORMALIZE_METHOD = "zscore"
+{% endif %}
+{% if denoising_method is defined %}
+DENOISING_METHOD = "{{ denoising_method }}"  # wavelet, savgol, none
+{% else %}
+DENOISING_METHOD = "none"
+{% endif %}
+{% if lead_selection is defined %}
+LEAD_SELECTION = {{ lead_selection }}  # List of lead indices to use
+{% else %}
+LEAD_SELECTION = None
+{% endif %}
+{% if resample_freq is defined %}
+RESAMPLE_FREQ = {{ resample_freq }}
+{% else %}
+RESAMPLE_FREQ = None
+{% endif %}
+
+os.makedirs("outputs", exist_ok=True)
+
+
+def load_raw_ecg():
+    """Load raw ECG data from quality check stage output.
+
+    Returns
+    -------
+    tuple
+        (signal, metadata) numpy array and dict.
+    """
+    print("[PREPROCESSING] Loading raw ECG data...")
+    signal = np.load(os.path.join("outputs", "raw_ecg_signal.npy"))
+    with open(os.path.join("outputs", "ecg_metadata.json"), "r") as f:
+        metadata = json.load(f)
+    print(f"[PREPROCESSING] Loaded: {signal.shape}, fs={metadata['fs']} Hz")
+    return signal, metadata
+
+
+def apply_bandpass_filter(signal, fs):
+    """Apply bandpass filter for ECG frequency range.
+
+    The bandpass filter retains the clinically relevant frequency range
+    while removing baseline wander (low-freq) and high-frequency noise.
+    AHA recommends 0.05-150 Hz for diagnostic ECG (Kligfield et al., 2007).
+
+    Parameters
+    ----------
+    signal : np.ndarray
+        ECG signal (samples x leads).
+    fs : float
+        Sampling frequency.
+
+    Returns
+    -------
+    np.ndarray
+        Filtered signal.
+    """
+    print(f"[PREPROCESSING] Applying bandpass filter: {HP_FREQ}-{LP_FREQ} Hz")
+    nyq = fs / 2
+    # Use 4th order Butterworth for minimal phase distortion
+    b, a = butter(4, [HP_FREQ / nyq, LP_FREQ / nyq], btype="bandpass")
+    filtered = np.zeros_like(signal)
+    for lead in range(signal.shape[1]):
+        filtered[:, lead] = filtfilt(b, a, signal[:, lead])
+    print("[PREPROCESSING] Bandpass filter applied")
+    return filtered
+
+
+def apply_notch_filter(signal, fs):
+    """Remove power line interference with notch filter.
+
+    Parameters
+    ----------
+    signal : np.ndarray
+        ECG signal.
+    fs : float
+        Sampling frequency.
+
+    Returns
+    -------
+    np.ndarray
+        Notch-filtered signal.
+    """
+    print(f"[PREPROCESSING] Applying notch filter at {NOTCH_FREQ} Hz")
+    # Apply notch at fundamental and harmonics
+    filtered = signal.copy()
+    for harmonic in [NOTCH_FREQ, NOTCH_FREQ * 2, NOTCH_FREQ * 3]:
+        if harmonic < fs / 2:
+            b, a = iirnotch(harmonic, Q=30, fs=fs)
+            for lead in range(signal.shape[1]):
+                filtered[:, lead] = filtfilt(b, a, filtered[:, lead])
+    return filtered
+
+
+def correct_baseline_wander(signal, fs):
+    """Remove baseline wander using cubic spline or moving median.
+
+    Baseline wander from respiration and electrode motion can shift
+    the isoelectric line, affecting ST-segment analysis and amplitude
+    measurements (Sornmo & Laguna, 2005 - Bioelectrical Signal Processing).
+
+    Parameters
+    ----------
+    signal : np.ndarray
+        ECG signal.
+    fs : float
+        Sampling frequency.
+
+    Returns
+    -------
+    np.ndarray
+        Baseline-corrected signal.
+    """
+    from scipy.ndimage import median_filter
+    print("[PREPROCESSING] Correcting baseline wander...")
+    # Two-pass median filter (Kaur et al., 2011)
+    window_1 = int(0.6 * fs)  # 600ms (wider than QRS)
+    window_2 = int(0.8 * fs)  # 800ms (wider than T-wave)
+    window_1 = window_1 if window_1 % 2 == 1 else window_1 + 1
+    window_2 = window_2 if window_2 % 2 == 1 else window_2 + 1
+
+    corrected = np.zeros_like(signal)
+    for lead in range(signal.shape[1]):
+        baseline_1 = median_filter(signal[:, lead], size=window_1)
+        baseline_2 = median_filter(baseline_1, size=window_2)
+        corrected[:, lead] = signal[:, lead] - baseline_2
+    print("[PREPROCESSING] Baseline wander corrected")
+    return corrected
+
+
+def normalize_amplitude(signal):
+    """Normalize ECG amplitude.
+
+    Parameters
+    ----------
+    signal : np.ndarray
+        ECG signal.
+
+    Returns
+    -------
+    np.ndarray
+        Normalized signal.
+    """
+    print(f"[PREPROCESSING] Normalizing amplitude: {NORMALIZE_METHOD}")
+    if NORMALIZE_METHOD == "zscore":
+        for lead in range(signal.shape[1]):
+            mu = np.mean(signal[:, lead])
+            std = np.std(signal[:, lead])
+            if std > 1e-10:
+                signal[:, lead] = (signal[:, lead] - mu) / std
+    elif NORMALIZE_METHOD == "minmax":
+        for lead in range(signal.shape[1]):
+            mn = np.min(signal[:, lead])
+            mx = np.max(signal[:, lead])
+            if mx - mn > 1e-10:
+                signal[:, lead] = (signal[:, lead] - mn) / (mx - mn)
+    return signal
+
+
+def apply_denoising(signal, fs):
+    """Apply advanced denoising.
+
+    Parameters
+    ----------
+    signal : np.ndarray
+        ECG signal.
+    fs : float
+        Sampling frequency.
+
+    Returns
+    -------
+    np.ndarray
+        Denoised signal.
+    """
+    if DENOISING_METHOD == "savgol":
+        # Savitzky-Golay filter preserves QRS morphology
+        print("[PREPROCESSING] Applying Savitzky-Golay denoising...")
+        window = int(0.02 * fs)  # 20ms window
+        window = window if window % 2 == 1 else window + 1
+        window = max(window, 5)
+        for lead in range(signal.shape[1]):
+            signal[:, lead] = savgol_filter(signal[:, lead], window, 3)
+    elif DENOISING_METHOD == "wavelet":
+        # Wavelet denoising (Donoho & Johnstone, 1994)
+        print("[PREPROCESSING] Applying wavelet denoising...")
+        try:
+            import pywt
+            for lead in range(signal.shape[1]):
+                coeffs = pywt.wavedec(signal[:, lead], "db4", level=4)
+                # Soft threshold detail coefficients
+                sigma = np.median(np.abs(coeffs[-1])) / 0.6745
+                threshold = sigma * np.sqrt(2 * np.log(len(signal[:, lead])))
+                coeffs[1:] = [pywt.threshold(c, threshold, mode="soft") for c in coeffs[1:]]
+                signal[:, lead] = pywt.waverec(coeffs, "db4")[:len(signal[:, lead])]
+        except ImportError:
+            print("[PREPROCESSING] WARNING: pywt not available, skipping wavelet denoising")
+    else:
+        print("[PREPROCESSING] No additional denoising applied")
+    return signal
+
+
+def select_leads(signal, metadata):
+    """Select specific leads for analysis.
+
+    Parameters
+    ----------
+    signal : np.ndarray
+        Full ECG signal.
+    metadata : dict
+        Recording metadata.
+
+    Returns
+    -------
+    tuple
+        (selected_signal, updated_metadata)
+    """
+    if LEAD_SELECTION is not None:
+        print(f"[PREPROCESSING] Selecting leads: {LEAD_SELECTION}")
+        signal = signal[:, LEAD_SELECTION]
+        metadata["n_leads"] = len(LEAD_SELECTION)
+        if metadata.get("sig_names"):
+            metadata["sig_names"] = [metadata["sig_names"][i] for i in LEAD_SELECTION if i < len(metadata["sig_names"])]
+    return signal, metadata
+
+
+def run_preprocessing():
+    """Execute the complete ECG preprocessing pipeline."""
+    print(f"[PREPROCESSING] Starting ECG preprocessing for: {DATASET_NAME}")
+
+    # Load raw data
+    signal, metadata = load_raw_ecg()
+    fs = metadata["fs"]
+
+    # Step 1: Lead selection
+    signal, metadata = select_leads(signal, metadata)
+
+    # Step 2: Baseline wander correction
+    signal = correct_baseline_wander(signal, fs)
+
+    # Step 3: Bandpass filter
+    signal = apply_bandpass_filter(signal, fs)
+
+    # Step 4: Notch filter
+    signal = apply_notch_filter(signal, fs)
+
+    # Step 5: Denoising
+    signal = apply_denoising(signal, fs)
+
+    # Step 6: Normalization
+    signal = normalize_amplitude(signal)
+
+    # Step 7: Resampling
+    if RESAMPLE_FREQ and RESAMPLE_FREQ != fs:
+        from scipy.signal import resample
+        print(f"[PREPROCESSING] Resampling from {fs} Hz to {RESAMPLE_FREQ} Hz")
+        n_samples_new = int(len(signal) * RESAMPLE_FREQ / fs)
+        signal = resample(signal, n_samples_new, axis=0)
+        metadata["fs"] = RESAMPLE_FREQ
+
+    # Save preprocessed data
+    output_path = os.path.join("outputs", "preprocessed_ecg.npy")
+    np.save(output_path, signal)
+    metadata_path = os.path.join("outputs", "preprocessed_metadata.json")
+    with open(metadata_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+    print(f"[PREPROCESSING] Preprocessed signal saved: {output_path}")
+    print(f"[PREPROCESSING] Final shape: {signal.shape}")
+
+    # Save summary
+    summary = {
+        "dataset_name": DATASET_NAME,
+        "hp_freq": HP_FREQ,
+        "lp_freq": LP_FREQ,
+        "notch_freq": NOTCH_FREQ,
+        "normalize_method": NORMALIZE_METHOD,
+        "denoising_method": DENOISING_METHOD,
+        "final_fs": metadata["fs"],
+        "n_leads": signal.shape[1],
+        "n_samples": signal.shape[0],
+    }
+    with open(os.path.join("outputs", "preprocessing_summary.json"), "w") as f:
+        json.dump(summary, f, indent=2)
+
+    return signal, metadata
+
+
+if __name__ == "__main__":
+    signal, metadata = run_preprocessing()

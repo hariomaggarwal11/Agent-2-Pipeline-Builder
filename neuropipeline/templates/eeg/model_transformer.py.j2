@@ -1,0 +1,286 @@
+"""
+EEG Transformer Model
+======================
+Dataset: {{ dataset_name }}
+Modality: EEG
+Purpose: Transformer-based architecture for EEG classification using
+         multi-head self-attention to capture long-range temporal dependencies
+         and inter-channel relationships in EEG signals.
+
+Reference: Vaswani et al. (2017) - Attention Is All You Need;
+           Song et al. (2022) - EEG Conformer for brain-computer interfaces.
+"""
+
+import os
+import json
+import math
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+
+# Neurophysiological rationale:
+# Self-attention mechanisms can capture non-local temporal dependencies
+# in EEG, which is critical for identifying event-related responses that
+# span multiple timescales. Unlike RNNs, transformers process all timesteps
+# in parallel, making them effective for capturing transient neural events
+# (e.g., P300, N400) alongside sustained oscillatory patterns.
+# (Song et al., 2022; Tao et al., 2023 - EEG-based emotion recognition)
+
+SEED = 42
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
+# Configuration
+DATASET_NAME = "{{ dataset_name }}"
+N_CHANNELS = {{ n_channels }}
+SEQ_LEN = {{ seq_len }}  # Sequence length (number of time steps)
+D_MODEL = {{ d_model }}  # Model dimension
+N_HEADS = {{ n_heads }}  # Number of attention heads
+N_LAYERS = {{ n_layers }}  # Number of transformer encoder layers
+N_CLASSES = {{ n_classes }}
+DROPOUT = {{ dropout }}
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+os.makedirs("outputs", exist_ok=True)
+
+
+class PositionalEncoding(nn.Module):
+    """Sinusoidal positional encoding for temporal position information.
+
+    Injects information about the absolute position of each timestep
+    in the sequence, allowing the model to attend to temporal order.
+    """
+
+    def __init__(self, d_model, max_len=5000, dropout=0.1):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)  # (1, max_len, d_model)
+        self.register_buffer("pe", pe)
+
+    def forward(self, x):
+        """Add positional encoding to input.
+
+        Parameters
+        ----------
+        x : Tensor
+            Input (batch, seq_len, d_model).
+
+        Returns
+        -------
+        Tensor
+            Position-encoded input.
+        """
+        x = x + self.pe[:, :x.size(1), :]
+        return self.dropout(x)
+
+
+class EEGTransformer(nn.Module):
+    """Transformer encoder for EEG classification.
+
+    Architecture:
+    1. Channel projection: maps EEG channels to model dimension
+    2. Positional encoding: adds temporal position information
+    3. Transformer encoder: multi-head self-attention layers
+    4. Classification head: global pooling + linear projection
+
+    Input shape: (batch_size, n_channels, seq_len)
+    Output shape: (batch_size, n_classes)
+    """
+
+    def __init__(self, n_channels=N_CHANNELS, seq_len=SEQ_LEN,
+                 d_model=D_MODEL, n_heads=N_HEADS, n_layers=N_LAYERS,
+                 n_classes=N_CLASSES, dropout=DROPOUT):
+        super().__init__()
+        self.d_model = d_model
+
+        # Input projection: channels -> d_model
+        self.input_proj = nn.Linear(n_channels, d_model)
+
+        # Positional encoding
+        self.pos_encoder = PositionalEncoding(d_model, max_len=seq_len, dropout=dropout)
+
+        # Transformer encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=n_heads,
+            dim_feedforward=d_model * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+        )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+
+        # Layer normalization
+        self.norm = nn.LayerNorm(d_model)
+
+        # Classification head
+        self.classifier = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model // 2, n_classes),
+        )
+
+        # CLS token for classification
+        self.cls_token = nn.Parameter(torch.randn(1, 1, d_model))
+
+        self._init_weights()
+
+    def _init_weights(self):
+        """Initialize weights with Xavier uniform."""
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+
+    def forward(self, x):
+        """Forward pass through transformer encoder.
+
+        Parameters
+        ----------
+        x : Tensor
+            EEG input (batch, n_channels, seq_len).
+
+        Returns
+        -------
+        Tensor
+            Class logits (batch, n_classes).
+        """
+        # Transpose to (batch, seq_len, n_channels)
+        x = x.permute(0, 2, 1)
+
+        # Project to model dimension
+        x = self.input_proj(x)  # (batch, seq_len, d_model)
+
+        # Add CLS token
+        batch_size = x.size(0)
+        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
+        x = torch.cat([cls_tokens, x], dim=1)  # (batch, seq_len+1, d_model)
+
+        # Add positional encoding
+        x = self.pos_encoder(x)
+
+        # Transformer encoder
+        x = self.transformer_encoder(x)
+        x = self.norm(x)
+
+        # Use CLS token for classification
+        cls_output = x[:, 0, :]  # (batch, d_model)
+
+        # Classify
+        output = self.classifier(cls_output)
+        return output
+
+
+def train_transformer():
+    """Train the EEG Transformer model."""
+    print(f"[MODEL_TRANSFORMER] Starting Transformer training for: {DATASET_NAME}")
+    print(f"[MODEL_TRANSFORMER] Config: d_model={D_MODEL}, heads={N_HEADS}, layers={N_LAYERS}")
+
+    # Load data
+    features = np.load(os.path.join("outputs", "selected_features.npy"))
+    labels = np.load(os.path.join("outputs", "selected_labels.npy"))
+    print(f"[MODEL_TRANSFORMER] Data shape: {features.shape}")
+
+    # Reshape to (batch, channels, seq_len)
+    n_samples = features.shape[0]
+    data = features.reshape(n_samples, N_CHANNELS, -1)
+    print(f"[MODEL_TRANSFORMER] Reshaped to: {data.shape}")
+
+    # Convert to tensors
+    X = torch.tensor(data, dtype=torch.float32)
+    y = torch.tensor(labels, dtype=torch.long)
+
+    # Train/val split
+    n_train = int(0.8 * n_samples)
+    indices = np.random.permutation(n_samples)
+    train_idx, val_idx = indices[:n_train], indices[n_train:]
+
+    train_loader = DataLoader(
+        TensorDataset(X[train_idx], y[train_idx]),
+        batch_size=32, shuffle=True
+    )
+    val_loader = DataLoader(
+        TensorDataset(X[val_idx], y[val_idx]),
+        batch_size=32, shuffle=False
+    )
+
+    # Model
+    model = EEGTransformer().to(DEVICE)
+    print(f"[MODEL_TRANSFORMER] Parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+    # REVIEW: Transformers typically need warmup scheduling for stable training
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
+    criterion = nn.CrossEntropyLoss()
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
+
+    best_val_acc = 0
+    patience_counter = 0
+    history = {"train_loss": [], "val_loss": [], "train_acc": [], "val_acc": []}
+
+    for epoch in range(100):
+        model.train()
+        train_loss, train_correct, train_total = 0, 0, 0
+        for batch_x, batch_y in train_loader:
+            batch_x, batch_y = batch_x.to(DEVICE), batch_y.to(DEVICE)
+            optimizer.zero_grad()
+            outputs = model(batch_x)
+            loss = criterion(outputs, batch_y)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            train_loss += loss.item()
+            _, predicted = outputs.max(1)
+            train_correct += predicted.eq(batch_y).sum().item()
+            train_total += batch_y.size(0)
+
+        scheduler.step()
+
+        model.eval()
+        val_loss, val_correct, val_total = 0, 0, 0
+        with torch.no_grad():
+            for batch_x, batch_y in val_loader:
+                batch_x, batch_y = batch_x.to(DEVICE), batch_y.to(DEVICE)
+                outputs = model(batch_x)
+                loss = criterion(outputs, batch_y)
+                val_loss += loss.item()
+                _, predicted = outputs.max(1)
+                val_correct += predicted.eq(batch_y).sum().item()
+                val_total += batch_y.size(0)
+
+        train_acc = train_correct / max(train_total, 1)
+        val_acc = val_correct / max(val_total, 1)
+        history["train_loss"].append(train_loss / len(train_loader))
+        history["val_loss"].append(val_loss / max(len(val_loader), 1))
+        history["train_acc"].append(train_acc)
+        history["val_acc"].append(val_acc)
+
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            patience_counter = 0
+            torch.save(model.state_dict(), os.path.join("outputs", "best_transformer.pth"))
+        else:
+            patience_counter += 1
+            if patience_counter >= 20:
+                print(f"[MODEL_TRANSFORMER] Early stopping at epoch {epoch+1}")
+                break
+
+        if (epoch + 1) % 20 == 0:
+            print(f"[MODEL_TRANSFORMER] Epoch {epoch+1}/100 - Val Acc: {val_acc:.4f}")
+
+    print(f"[MODEL_TRANSFORMER] Training complete. Best val accuracy: {best_val_acc:.4f}")
+    with open(os.path.join("outputs", "transformer_history.json"), "w") as f:
+        json.dump(history, f, indent=2)
+
+    return model, history
+
+
+if __name__ == "__main__":
+    model, history = train_transformer()

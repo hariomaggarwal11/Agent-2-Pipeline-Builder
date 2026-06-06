@@ -1,0 +1,239 @@
+"""
+ECG 1D-CNN Model
+=================
+Dataset: {{ dataset_name }}
+Modality: ECG
+Purpose: 1D Convolutional Neural Network for ECG beat classification.
+         Learns hierarchical morphological features directly from raw
+         beat waveforms for arrhythmia detection.
+
+Reference: Kiranyaz et al. (2016) - Real-Time Patient-Specific ECG
+           Classification by 1-D Convolutional Neural Networks.
+"""
+
+import os
+import json
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+
+# Neurophysiological rationale:
+# 1D CNNs can automatically learn morphological ECG features (QRS shape,
+# ST-segment deviation, T-wave abnormalities) directly from raw signals.
+# Hierarchical feature learning captures both fine-grained (QRS morphology)
+# and coarse (rhythm) patterns through increasing receptive fields.
+# (Acharya et al., 2017 - A deep convolutional neural network model to
+#  classify heartbeats)
+
+SEED = 42
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
+# Configuration
+DATASET_NAME = "{{ dataset_name }}"
+{% if n_classes is defined %}
+N_CLASSES = {{ n_classes }}
+{% else %}
+N_CLASSES = 5
+{% endif %}
+{% if n_leads is defined %}
+N_LEADS = {{ n_leads }}
+{% else %}
+N_LEADS = 1
+{% endif %}
+{% if beat_length is defined %}
+BEAT_LENGTH = {{ beat_length }}
+{% else %}
+BEAT_LENGTH = 256
+{% endif %}
+{% if dropout is defined %}
+DROPOUT = {{ dropout }}
+{% else %}
+DROPOUT = 0.3
+{% endif %}
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+os.makedirs("outputs", exist_ok=True)
+
+
+class ECG_CNN1D(nn.Module):
+    """1D Convolutional Neural Network for ECG classification.
+
+    Architecture:
+    - 3 convolutional blocks with increasing filters (32, 64, 128)
+    - Each block: Conv1D -> BatchNorm -> ReLU -> MaxPool -> Dropout
+    - Global average pooling
+    - Fully connected classification head
+
+    Input shape: (batch_size, n_leads, beat_length)
+    Output shape: (batch_size, n_classes)
+    """
+
+    def __init__(self, n_leads=N_LEADS, beat_length=BEAT_LENGTH,
+                 n_classes=N_CLASSES, dropout=DROPOUT):
+        super().__init__()
+
+        # Convolutional blocks - learn hierarchical features
+        self.conv_blocks = nn.Sequential(
+            # Block 1: Fine-grained features (QRS morphology)
+            nn.Conv1d(n_leads, 32, kernel_size=7, padding=3),
+            nn.BatchNorm1d(32),
+            nn.ReLU(),
+            nn.MaxPool1d(2),
+            nn.Dropout(dropout),
+
+            # Block 2: Mid-level features (P-wave, T-wave shapes)
+            nn.Conv1d(32, 64, kernel_size=5, padding=2),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.MaxPool1d(2),
+            nn.Dropout(dropout),
+
+            # Block 3: High-level features (beat-level patterns)
+            nn.Conv1d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.MaxPool1d(2),
+            nn.Dropout(dropout),
+
+            # Block 4: Abstract representations
+            nn.Conv1d(128, 256, kernel_size=3, padding=1),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+        )
+
+        # Global average pooling
+        self.gap = nn.AdaptiveAvgPool1d(1)
+
+        # Classifier
+        self.classifier = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(128, n_classes),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        """Initialize weights using He initialization."""
+        for m in self.modules():
+            if isinstance(m, nn.Conv1d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+            elif isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        """Forward pass.
+
+        Parameters
+        ----------
+        x : Tensor
+            Input (batch, n_leads, beat_length).
+
+        Returns
+        -------
+        Tensor
+            Class logits (batch, n_classes).
+        """
+        x = self.conv_blocks(x)
+        x = self.gap(x).squeeze(-1)
+        x = self.classifier(x)
+        return x
+
+
+def train_cnn1d():
+    """Train the 1D CNN model for ECG classification."""
+    print(f"[MODEL_CNN1D] Starting training for: {DATASET_NAME}")
+    print(f"[MODEL_CNN1D] Config: leads={N_LEADS}, classes={N_CLASSES}")
+
+    # Load data
+    features = np.load(os.path.join("outputs", "selected_features.npy"))
+    labels = np.load(os.path.join("outputs", "selected_labels.npy"))
+    print(f"[MODEL_CNN1D] Data: {features.shape}, Labels: {np.unique(labels)}")
+
+    # Reshape for CNN: (batch, channels/leads, length)
+    n_samples = features.shape[0]
+    data = features.reshape(n_samples, N_LEADS, -1)
+    print(f"[MODEL_CNN1D] Input shape: {data.shape}")
+
+    # Tensors
+    X = torch.tensor(data, dtype=torch.float32)
+    y = torch.tensor(labels, dtype=torch.long)
+
+    # Train/val split
+    n_train = int(0.8 * n_samples)
+    indices = np.random.permutation(n_samples)
+    train_idx, val_idx = indices[:n_train], indices[n_train:]
+
+    train_loader = DataLoader(TensorDataset(X[train_idx], y[train_idx]), batch_size=64, shuffle=True)
+    val_loader = DataLoader(TensorDataset(X[val_idx], y[val_idx]), batch_size=64, shuffle=False)
+
+    # Model
+    model = ECG_CNN1D().to(DEVICE)
+    print(f"[MODEL_CNN1D] Parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+    # REVIEW: Consider class-weighted loss for imbalanced arrhythmia datasets
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    criterion = nn.CrossEntropyLoss()
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=10, factor=0.5)
+
+    best_val_acc = 0
+    history = {"train_loss": [], "val_loss": [], "train_acc": [], "val_acc": []}
+
+    for epoch in range(100):
+        model.train()
+        train_loss, train_correct, train_total = 0, 0, 0
+        for batch_x, batch_y in train_loader:
+            batch_x, batch_y = batch_x.to(DEVICE), batch_y.to(DEVICE)
+            optimizer.zero_grad()
+            outputs = model(batch_x)
+            loss = criterion(outputs, batch_y)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+            _, predicted = outputs.max(1)
+            train_correct += predicted.eq(batch_y).sum().item()
+            train_total += batch_y.size(0)
+
+        model.eval()
+        val_loss, val_correct, val_total = 0, 0, 0
+        with torch.no_grad():
+            for batch_x, batch_y in val_loader:
+                batch_x, batch_y = batch_x.to(DEVICE), batch_y.to(DEVICE)
+                outputs = model(batch_x)
+                loss = criterion(outputs, batch_y)
+                val_loss += loss.item()
+                _, predicted = outputs.max(1)
+                val_correct += predicted.eq(batch_y).sum().item()
+                val_total += batch_y.size(0)
+
+        train_acc = train_correct / max(train_total, 1)
+        val_acc = val_correct / max(val_total, 1)
+        history["train_loss"].append(train_loss / len(train_loader))
+        history["val_loss"].append(val_loss / max(len(val_loader), 1))
+        history["train_acc"].append(train_acc)
+        history["val_acc"].append(val_acc)
+
+        scheduler.step(val_loss)
+
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            torch.save(model.state_dict(), os.path.join("outputs", "best_cnn1d.pth"))
+
+        if (epoch + 1) % 20 == 0:
+            print(f"[MODEL_CNN1D] Epoch {epoch+1}/100 - Val Acc: {val_acc:.4f}")
+
+    print(f"[MODEL_CNN1D] Training complete. Best val accuracy: {best_val_acc:.4f}")
+    with open(os.path.join("outputs", "cnn1d_history.json"), "w") as f:
+        json.dump(history, f, indent=2)
+
+    return model, history
+
+
+if __name__ == "__main__":
+    model, history = train_cnn1d()

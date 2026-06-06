@@ -1,0 +1,227 @@
+"""
+ECG Feature Selection Stage
+==============================
+Dataset: {{ dataset_name }}
+Modality: ECG
+Purpose: Select the most discriminative ECG features using {{ method }}
+         and apply normalization for optimal classifier performance.
+
+Feature selection is critical for ECG due to the high dimensionality of
+combined HRV + morphological feature spaces.
+"""
+
+import os
+import json
+import numpy as np
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.feature_selection import mutual_info_classif, f_classif, SelectKBest
+
+# Neurophysiological rationale:
+# ECG feature spaces combine HRV metrics (global per-recording) with
+# morphological features (per-beat), creating high dimensionality.
+# mRMR is the default for ECG as it handles correlated features well -
+# HRV features like SDNN and RMSSD are inherently correlated since both
+# derive from RR intervals (Peng et al., 2005).
+
+SEED = 42
+np.random.seed(SEED)
+
+# Configuration
+DATASET_NAME = "{{ dataset_name }}"
+METHOD = "{{ method }}"  # mRMR, mutual_info, ANOVA, RFE, None
+TOP_K = {{ top_k }}
+NORMALIZER = "{{ normalizer }}"  # standard, minmax, none
+
+os.makedirs("outputs", exist_ok=True)
+
+
+def load_features():
+    """Load extracted ECG features.
+
+    Returns
+    -------
+    tuple
+        (features, labels)
+    """
+    print("[FEATURE_SELECTION] Loading ECG features...")
+    features = np.load(os.path.join("outputs", "features.npy"))
+    labels_path = os.path.join("outputs", "feature_labels.npy")
+    if os.path.exists(labels_path):
+        labels = np.load(labels_path)
+    else:
+        # Try beat labels
+        labels_path = os.path.join("outputs", "beat_labels.npy")
+        if os.path.exists(labels_path):
+            labels = np.load(labels_path)
+        else:
+            print("[FEATURE_SELECTION] WARNING: No labels found, using dummy labels")
+            labels = np.zeros(features.shape[0], dtype=int)
+    print(f"[FEATURE_SELECTION] Features: {features.shape}, Labels: {labels.shape}")
+    return features, labels
+
+
+def normalize_features(features):
+    """Apply feature normalization.
+
+    Parameters
+    ----------
+    features : np.ndarray
+        Feature matrix.
+
+    Returns
+    -------
+    tuple
+        (normalized_features, scaler)
+    """
+    print(f"[FEATURE_SELECTION] Normalizing: {NORMALIZER}")
+    if NORMALIZER == "standard":
+        scaler = StandardScaler()
+        features_norm = scaler.fit_transform(features)
+    elif NORMALIZER == "minmax":
+        scaler = MinMaxScaler()
+        features_norm = scaler.fit_transform(features)
+    else:
+        scaler = None
+        features_norm = features
+    return features_norm, scaler
+
+
+def select_mrmr(features, labels, k):
+    """Minimum Redundancy Maximum Relevance feature selection.
+
+    Default method for ECG due to high inter-feature correlation in HRV metrics.
+    Selects features that are maximally relevant to the target (arrhythmia type)
+    while minimally redundant with each other (Peng et al., 2005).
+
+    Parameters
+    ----------
+    features : np.ndarray
+        Feature matrix.
+    labels : np.ndarray
+        Target labels.
+    k : int
+        Number of features to select.
+
+    Returns
+    -------
+    np.ndarray
+        Selected feature indices.
+    """
+    print(f"[FEATURE_SELECTION] Running mRMR (top {k})...")
+    n_features = features.shape[1]
+    k = min(k, n_features)
+
+    # Compute MI with target
+    mi_target = mutual_info_classif(features, labels, random_state=SEED)
+
+    selected = []
+    remaining = list(range(n_features))
+
+    # First feature: highest MI
+    first = np.argmax(mi_target)
+    selected.append(first)
+    remaining.remove(first)
+
+    # Iterative selection
+    for _ in range(k - 1):
+        best_score = -np.inf
+        best_feat = None
+        for feat in remaining:
+            relevance = mi_target[feat]
+            redundancy = np.mean([
+                np.abs(np.corrcoef(features[:, feat], features[:, s])[0, 1])
+                for s in selected
+            ])
+            score = relevance - redundancy
+            if score > best_score:
+                best_score = score
+                best_feat = feat
+        if best_feat is not None:
+            selected.append(best_feat)
+            remaining.remove(best_feat)
+
+    # REVIEW: mRMR selection - verify selected features include both HRV and morphological
+    print(f"[FEATURE_SELECTION] mRMR selected {len(selected)} features")
+    return np.array(selected)
+
+
+def select_mutual_info(features, labels, k):
+    """MI-based feature selection."""
+    print(f"[FEATURE_SELECTION] Running MI selection (top {k})...")
+    mi_scores = mutual_info_classif(features, labels, random_state=SEED)
+    top_indices = np.argsort(mi_scores)[::-1][:k]
+    return top_indices
+
+
+def select_anova(features, labels, k):
+    """ANOVA F-value feature selection."""
+    print(f"[FEATURE_SELECTION] Running ANOVA (top {k})...")
+    selector = SelectKBest(score_func=f_classif, k=min(k, features.shape[1]))
+    selector.fit(features, labels)
+    top_indices = np.argsort(selector.scores_)[::-1][:k]
+    return top_indices
+
+
+def select_rfe(features, labels, k):
+    """Recursive Feature Elimination."""
+    from sklearn.svm import LinearSVC
+    from sklearn.feature_selection import RFE
+    print(f"[FEATURE_SELECTION] Running RFE (top {k})...")
+    estimator = LinearSVC(random_state=SEED, max_iter=5000)
+    selector = RFE(estimator, n_features_to_select=min(k, features.shape[1]), step=1)
+    selector.fit(features, labels)
+    return np.where(selector.support_)[0]
+
+
+def run_feature_selection():
+    """Execute the ECG feature selection pipeline."""
+    print(f"[FEATURE_SELECTION] Starting for: {DATASET_NAME}")
+    print(f"[FEATURE_SELECTION] Method: {METHOD}, Top-K: {TOP_K}")
+
+    features, labels = load_features()
+    features_norm, scaler = normalize_features(features)
+
+    # Select features
+    if METHOD == "None" or METHOD == "none":
+        selected_indices = np.arange(features_norm.shape[1])
+        selected_features = features_norm
+    elif METHOD == "mRMR":
+        selected_indices = select_mrmr(features_norm, labels, TOP_K)
+        selected_features = features_norm[:, selected_indices]
+    elif METHOD == "mutual_info":
+        selected_indices = select_mutual_info(features_norm, labels, TOP_K)
+        selected_features = features_norm[:, selected_indices]
+    elif METHOD == "ANOVA":
+        selected_indices = select_anova(features_norm, labels, TOP_K)
+        selected_features = features_norm[:, selected_indices]
+    elif METHOD == "RFE":
+        selected_indices = select_rfe(features_norm, labels, TOP_K)
+        selected_features = features_norm[:, selected_indices]
+    else:
+        selected_indices = np.arange(features_norm.shape[1])
+        selected_features = features_norm
+
+    print(f"[FEATURE_SELECTION] Selected: {selected_features.shape}")
+
+    # Save
+    np.save(os.path.join("outputs", "selected_features.npy"), selected_features)
+    np.save(os.path.join("outputs", "selected_labels.npy"), labels)
+
+    summary = {
+        "dataset_name": DATASET_NAME,
+        "method": METHOD,
+        "original_n_features": features.shape[1],
+        "selected_n_features": selected_features.shape[1],
+        "top_k": TOP_K,
+        "normalizer": NORMALIZER,
+        "selected_indices": selected_indices.tolist(),
+    }
+    with open(os.path.join("outputs", "feature_selection_summary.json"), "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"[FEATURE_SELECTION] Summary saved")
+
+    return selected_features, labels
+
+
+if __name__ == "__main__":
+    features, labels = run_feature_selection()

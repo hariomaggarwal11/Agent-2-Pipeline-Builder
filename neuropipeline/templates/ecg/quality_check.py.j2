@@ -1,0 +1,344 @@
+"""
+ECG Quality Check Stage
+========================
+Dataset: {{ dataset_name }}
+Modality: ECG
+Purpose: Load Agent 1 inspection report, load raw ECG data, and evaluate
+         signal quality including baseline wander, signal clipping, noise
+         levels, and lead connectivity assessment.
+
+Quality assessment ensures only clinically viable ECG recordings proceed
+through the analysis pipeline.
+"""
+
+import os
+import json
+import numpy as np
+
+# Neurophysiological rationale:
+# ECG signal quality directly impacts R-peak detection accuracy and
+# morphological analysis. Common ECG artifacts include:
+# - Baseline wander from respiration/electrode movement
+# - Power line interference (50/60 Hz)
+# - Muscle noise (EMG contamination)
+# - Signal clipping from ADC saturation
+# - Electrode disconnection (flat signals)
+# (Satija et al., 2018 - A review of signal processing techniques for ECG)
+
+SEED = 42
+np.random.seed(SEED)
+
+# Configuration
+DATASET_NAME = "{{ dataset_name }}"
+DATA_FORMAT = "{{ format }}"
+QUALITY_SCORE = {{ quality_score }}
+FILEPATH = "{{ filepath }}"
+QUALITY_THRESHOLD = {{ quality_threshold }}
+FAIL_ON_CLIPPING = {{ fail_on_clipping }}
+FAIL_ON_NOISE = {{ fail_on_noise }}
+
+os.makedirs("outputs", exist_ok=True)
+
+
+def load_agent1_report(report_path):
+    """Load and parse the Agent 1 inspection report.
+
+    Parameters
+    ----------
+    report_path : str
+        Path to the Agent 1 JSON report.
+
+    Returns
+    -------
+    dict
+        Parsed report with quality metrics.
+    """
+    print("[QUALITY_CHECK] Loading Agent 1 inspection report...")
+    if os.path.exists(report_path):
+        with open(report_path, "r") as f:
+            report = json.load(f)
+        print(f"[QUALITY_CHECK] Report loaded - quality score: {report.get('quality_score', {}).get('score', 'N/A')}")
+        return report
+    else:
+        print("[QUALITY_CHECK] WARNING: Agent 1 report not found, proceeding with raw assessment")
+        return {}
+
+
+def load_ecg_data(filepath):
+    """Load raw ECG data.
+
+    Supports multiple formats: WFDB (.dat/.hea), EDF, CSV.
+
+    Parameters
+    ----------
+    filepath : str
+        Path to the ECG data file.
+
+    Returns
+    -------
+    tuple
+        (signal, metadata) where signal is numpy array and metadata is dict.
+    """
+    print(f"[QUALITY_CHECK] Loading ECG from: {filepath}")
+
+    if filepath.endswith(".dat") or filepath.endswith(".hea"):
+        import wfdb
+        record_name = filepath.replace(".dat", "").replace(".hea", "")
+        record = wfdb.rdrecord(record_name)
+        signal = record.p_signal
+        metadata = {
+            "fs": record.fs,
+            "n_leads": record.n_sig,
+            "sig_names": record.sig_name,
+            "units": record.units,
+            "duration_seconds": record.sig_len / record.fs,
+        }
+    elif filepath.endswith(".edf"):
+        import pyedflib
+        f = pyedflib.EdfReader(filepath)
+        n_signals = f.signals_in_file
+        signal = np.array([f.readSignal(i) for i in range(n_signals)]).T
+        metadata = {
+            "fs": f.getSampleFrequency(0),
+            "n_leads": n_signals,
+            "sig_names": [f.getLabel(i) for i in range(n_signals)],
+            "duration_seconds": signal.shape[0] / f.getSampleFrequency(0),
+        }
+        f.close()
+    else:
+        # CSV fallback
+        signal = np.loadtxt(filepath, delimiter=",", skiprows=1)
+        metadata = {"fs": 500, "n_leads": signal.shape[1], "sig_names": [], "duration_seconds": 0}
+        metadata["duration_seconds"] = len(signal) / metadata["fs"]
+
+    print(f"[QUALITY_CHECK] Loaded: {metadata['n_leads']} leads, {metadata['fs']} Hz, "
+          f"{metadata['duration_seconds']:.1f}s")
+    return signal, metadata
+
+
+def detect_clipping(signal, threshold_percentile=99.5):
+    """Detect signal clipping (ADC saturation).
+
+    Clipping occurs when the signal amplitude exceeds the ADC range,
+    causing flat-topped peaks that distort morphological features
+    (especially QRS amplitude).
+
+    Parameters
+    ----------
+    signal : np.ndarray
+        ECG signal (samples x leads).
+    threshold_percentile : float
+        Percentile to identify potential clipping level.
+
+    Returns
+    -------
+    dict
+        Clipping assessment per lead.
+    """
+    print("[QUALITY_CHECK] Detecting signal clipping...")
+    clipping_report = {}
+    for lead_idx in range(signal.shape[1]):
+        lead_data = signal[:, lead_idx]
+        upper_clip = np.percentile(lead_data, threshold_percentile)
+        lower_clip = np.percentile(lead_data, 100 - threshold_percentile)
+        # Count samples at clip level
+        upper_clipped = np.sum(lead_data >= upper_clip * 0.99)
+        lower_clipped = np.sum(lead_data <= lower_clip * 1.01)
+        total_clipped = upper_clipped + lower_clipped
+        clip_pct = total_clipped / len(lead_data) * 100
+        clipping_report[f"lead_{lead_idx}"] = {
+            "clip_percentage": float(clip_pct),
+            "is_clipped": clip_pct > 1.0,
+        }
+    clipped_leads = sum(1 for v in clipping_report.values() if v["is_clipped"])
+    print(f"[QUALITY_CHECK] Clipped leads: {clipped_leads}/{signal.shape[1]}")
+    return clipping_report
+
+
+def assess_noise_level(signal, fs):
+    """Assess noise level using signal-to-noise ratio estimation.
+
+    Noise assessment helps determine if additional denoising is needed.
+    High-frequency noise (>100 Hz) indicates EMG contamination or
+    electromagnetic interference.
+
+    Parameters
+    ----------
+    signal : np.ndarray
+        ECG signal.
+    fs : float
+        Sampling frequency.
+
+    Returns
+    -------
+    dict
+        SNR estimates per lead.
+    """
+    from scipy.signal import butter, filtfilt
+    print("[QUALITY_CHECK] Assessing noise levels...")
+    noise_report = {}
+
+    for lead_idx in range(signal.shape[1]):
+        lead_data = signal[:, lead_idx]
+        # Estimate signal (0.5-40 Hz band)
+        b, a = butter(4, [0.5, min(40, fs/2 - 1)], btype="bandpass", fs=fs)
+        clean_signal = filtfilt(b, a, lead_data)
+        noise = lead_data - clean_signal
+        snr = 10 * np.log10(np.var(clean_signal) / (np.var(noise) + 1e-10))
+        noise_report[f"lead_{lead_idx}"] = {
+            "snr_db": float(snr),
+            "noise_rms": float(np.sqrt(np.mean(noise ** 2))),
+            "acceptable": snr > 10,
+        }
+
+    avg_snr = np.mean([v["snr_db"] for v in noise_report.values()])
+    print(f"[QUALITY_CHECK] Average SNR: {avg_snr:.1f} dB")
+    return noise_report
+
+
+def detect_flat_segments(signal, fs, min_duration_s=2.0):
+    """Detect flat (disconnected) segments indicating lead failure.
+
+    Parameters
+    ----------
+    signal : np.ndarray
+        ECG signal.
+    fs : float
+        Sampling frequency.
+    min_duration_s : float
+        Minimum flat duration to flag (seconds).
+
+    Returns
+    -------
+    dict
+        Flat segment assessment per lead.
+    """
+    print("[QUALITY_CHECK] Detecting flat segments...")
+    flat_report = {}
+    window = int(min_duration_s * fs)
+
+    for lead_idx in range(signal.shape[1]):
+        lead_data = signal[:, lead_idx]
+        is_flat = False
+        for start in range(0, len(lead_data) - window, window // 2):
+            segment = lead_data[start:start + window]
+            if np.std(segment) < 1e-6:
+                is_flat = True
+                break
+        flat_report[f"lead_{lead_idx}"] = {"has_flat_segment": is_flat}
+
+    flat_count = sum(1 for v in flat_report.values() if v["has_flat_segment"])
+    print(f"[QUALITY_CHECK] Leads with flat segments: {flat_count}/{signal.shape[1]}")
+    return flat_report
+
+
+def compute_quality_score(signal, metadata, clipping_report, noise_report, flat_report):
+    """Compute overall ECG quality score (0-100).
+
+    Parameters
+    ----------
+    signal : np.ndarray
+        ECG signal.
+    metadata : dict
+        Recording metadata.
+    clipping_report : dict
+        Clipping assessment.
+    noise_report : dict
+        Noise assessment.
+    flat_report : dict
+        Flat segment assessment.
+
+    Returns
+    -------
+    float
+        Quality score.
+    """
+    n_leads = signal.shape[1]
+    base_score = QUALITY_SCORE
+
+    # Penalties
+    clipped = sum(1 for v in clipping_report.values() if v["is_clipped"])
+    clip_penalty = (clipped / n_leads) * 25
+
+    noisy = sum(1 for v in noise_report.values() if not v["acceptable"])
+    noise_penalty = (noisy / n_leads) * 30
+
+    flat = sum(1 for v in flat_report.values() if v["has_flat_segment"])
+    flat_penalty = (flat / n_leads) * 35
+
+    score = max(0, base_score - clip_penalty - noise_penalty - flat_penalty)
+    return round(score, 2)
+
+
+def run_quality_check():
+    """Execute the complete ECG quality check pipeline."""
+    print(f"[QUALITY_CHECK] Starting ECG quality assessment for: {DATASET_NAME}")
+    print(f"[QUALITY_CHECK] Quality threshold: {QUALITY_THRESHOLD}")
+
+    # Load Agent 1 report
+    report_path = os.path.join("outputs", "agent1_report.json")
+    agent1_report = load_agent1_report(report_path)
+
+    # Load ECG data
+    signal, metadata = load_ecg_data(FILEPATH)
+
+    # Run quality assessments
+    clipping_report = detect_clipping(signal)
+    noise_report = assess_noise_level(signal, metadata["fs"])
+    flat_report = detect_flat_segments(signal, metadata["fs"])
+    quality_score = compute_quality_score(signal, metadata, clipping_report, noise_report, flat_report)
+
+    print(f"[QUALITY_CHECK] Computed quality score: {quality_score}")
+
+    # Apply failure criteria
+    passed = True
+    reasons = []
+
+    if quality_score < QUALITY_THRESHOLD:
+        passed = False
+        reasons.append(f"Quality score {quality_score} below threshold {QUALITY_THRESHOLD}")
+
+    if FAIL_ON_CLIPPING:
+        clipped = sum(1 for v in clipping_report.values() if v["is_clipped"])
+        if clipped > 0:
+            # REVIEW: Consider allowing minor clipping if < 20% of leads
+            passed = False
+            reasons.append(f"Signal clipping detected in {clipped} leads")
+
+    if FAIL_ON_NOISE:
+        noisy = sum(1 for v in noise_report.values() if not v["acceptable"])
+        if noisy > signal.shape[1] // 2:
+            passed = False
+            reasons.append(f"Excessive noise in {noisy}/{signal.shape[1]} leads")
+
+    # Save quality report
+    quality_report = {
+        "dataset_name": DATASET_NAME,
+        "format": DATA_FORMAT,
+        "quality_score": quality_score,
+        "quality_threshold": QUALITY_THRESHOLD,
+        "passed": passed,
+        "failure_reasons": reasons,
+        "n_leads": int(metadata["n_leads"]),
+        "sampling_rate": metadata["fs"],
+        "duration_seconds": metadata["duration_seconds"],
+        "clipping": clipping_report,
+        "noise": {k: v["snr_db"] for k, v in noise_report.items()},
+        "flat_segments": flat_report,
+    }
+
+    output_path = os.path.join("outputs", "quality_report.json")
+    with open(output_path, "w") as f:
+        json.dump(quality_report, f, indent=2)
+    print(f"[QUALITY_CHECK] Report saved to: {output_path}")
+
+    if passed:
+        print("[QUALITY_CHECK] PASSED - ECG data meets quality requirements")
+    else:
+        print(f"[QUALITY_CHECK] FAILED - Reasons: {reasons}")
+
+    return quality_report
+
+
+if __name__ == "__main__":
+    result = run_quality_check()

@@ -1,0 +1,303 @@
+"""
+EEG Preprocessing Stage
+========================
+Dataset: {{ dataset_name }}
+Modality: EEG
+Purpose: Apply signal preprocessing including bandpass filtering, notch filtering,
+         re-referencing, ICA-based artifact removal, bad channel interpolation,
+         and optional downsampling to prepare clean data for feature extraction.
+
+Preprocessing follows established best practices from the PREP pipeline
+(Bigdely-Shamlo et al., 2015) and MNE-Python recommendations.
+"""
+
+import os
+import json
+import numpy as np
+import mne
+
+# Neurophysiological rationale:
+# EEG preprocessing removes non-neural artifacts while preserving brain signals.
+# Bandpass filtering ({{ hp_freq }}-{{ lp_freq }} Hz) retains the frequency range of
+# interest: delta (0.5-4), theta (4-8), alpha (8-13), beta (13-30), gamma (30-100).
+# Notch filtering removes power line interference. Re-referencing ensures signals
+# are measured relative to a common potential (Luck, 2014 - An Introduction to the
+# Event-Related Potential Technique).
+
+SEED = 42
+np.random.seed(SEED)
+
+# Configuration
+DATASET_NAME = "{{ dataset_name }}"
+HP_FREQ = {{ hp_freq }}  # High-pass cutoff frequency (Hz)
+LP_FREQ = {{ lp_freq }}  # Low-pass cutoff frequency (Hz)
+NOTCH_FREQ = {{ notch_freq }}  # Notch filter frequency (Hz) - 50 or 60
+REFERENCE_METHOD = "{{ reference_method }}"  # CAR, linked_mastoid, Laplacian, REST
+ICA_ENABLED = {{ ica_enabled }}
+{% if ica_enabled %}
+ICA_METHOD = "{{ ica_method }}"  # fastica, infomax, picard
+N_COMPONENTS = {{ n_components }}  # Number of ICA components
+{% endif %}
+{% if downsample_freq is defined and downsample_freq %}
+DOWNSAMPLE_FREQ = {{ downsample_freq }}
+{% endif %}
+
+os.makedirs("outputs", exist_ok=True)
+
+
+def load_quality_report():
+    """Load the quality report from previous stage."""
+    report_path = os.path.join("outputs", "quality_report.json")
+    if os.path.exists(report_path):
+        with open(report_path, "r") as f:
+            return json.load(f)
+    return {}
+
+
+def apply_bandpass_filter(raw):
+    """Apply bandpass filter to retain neural frequency bands.
+
+    FIR filtering is used for its linear phase response, which preserves
+    temporal structure of ERPs (Widmann et al., 2015 - Digital filter design
+    for electrophysiological data).
+
+    Parameters
+    ----------
+    raw : mne.io.Raw
+        Raw EEG data.
+
+    Returns
+    -------
+    mne.io.Raw
+        Filtered data.
+    """
+    print(f"[PREPROCESSING] Applying bandpass filter: {HP_FREQ}-{LP_FREQ} Hz")
+    raw.filter(l_freq=HP_FREQ, h_freq=LP_FREQ, method="fir", fir_design="firwin")
+    print("[PREPROCESSING] Bandpass filter applied")
+    return raw
+
+
+def apply_notch_filter(raw):
+    """Remove power line interference with notch filter.
+
+    Parameters
+    ----------
+    raw : mne.io.Raw
+        Filtered EEG data.
+
+    Returns
+    -------
+    mne.io.Raw
+        Notch-filtered data.
+    """
+    print(f"[PREPROCESSING] Applying notch filter at {NOTCH_FREQ} Hz (and harmonics)")
+    # Also remove harmonics (e.g., 100, 150 Hz for 50 Hz line noise)
+    notch_freqs = [NOTCH_FREQ * i for i in range(1, 4) if NOTCH_FREQ * i < raw.info["sfreq"] / 2]
+    raw.notch_filter(freqs=notch_freqs, method="fir")
+    print(f"[PREPROCESSING] Notch filter applied at: {notch_freqs} Hz")
+    return raw
+
+
+def apply_reference(raw):
+    """Apply re-referencing scheme.
+
+    Reference choice impacts spatial topography interpretation:
+    - CAR (Common Average Reference): suitable for high-density arrays (>32 ch)
+    - Linked mastoids: standard for emotion/clinical studies
+    - Laplacian: enhances focal activity, reduces volume conduction
+    - REST: Reference Electrode Standardization Technique (Yao, 2001)
+
+    Parameters
+    ----------
+    raw : mne.io.Raw
+        EEG data.
+
+    Returns
+    -------
+    mne.io.Raw
+        Re-referenced data.
+    """
+    # REVIEW: Reference method '{{ reference_method }}' chosen - verify appropriateness for this dataset
+    print(f"[PREPROCESSING] Applying reference: {REFERENCE_METHOD}")
+    if REFERENCE_METHOD == "CAR":
+        raw.set_eeg_reference("average", projection=False)
+    elif REFERENCE_METHOD == "linked_mastoid":
+        # Assumes mastoid channels named TP9/TP10 or M1/M2
+        mastoid_chs = [ch for ch in raw.ch_names if ch in ["TP9", "TP10", "M1", "M2", "A1", "A2"]]
+        if mastoid_chs:
+            raw.set_eeg_reference(ref_channels=mastoid_chs)
+        else:
+            print("[PREPROCESSING] WARNING: Mastoid channels not found, falling back to CAR")
+            raw.set_eeg_reference("average", projection=False)
+    elif REFERENCE_METHOD == "Laplacian":
+        # Surface Laplacian (current source density)
+        # Requires electrode positions
+        if raw.info.get("dig"):
+            raw = mne.preprocessing.compute_current_source_density(raw)
+        else:
+            print("[PREPROCESSING] WARNING: No digitization points for Laplacian, using CAR")
+            raw.set_eeg_reference("average", projection=False)
+    elif REFERENCE_METHOD == "REST":
+        raw.set_eeg_reference("REST", projection=False)
+    else:
+        raw.set_eeg_reference("average", projection=False)
+    print(f"[PREPROCESSING] Reference applied: {REFERENCE_METHOD}")
+    return raw
+
+
+def interpolate_bad_channels(raw, bad_channels):
+    """Interpolate bad channels using spherical spline interpolation.
+
+    Spherical spline interpolation reconstructs signals at bad electrode
+    locations from surrounding good channels (Perrin et al., 1989).
+
+    Parameters
+    ----------
+    raw : mne.io.Raw
+        EEG data.
+    bad_channels : list
+        Channel names to interpolate.
+
+    Returns
+    -------
+    mne.io.Raw
+        Data with interpolated channels.
+    """
+    if bad_channels:
+        print(f"[PREPROCESSING] Interpolating bad channels: {bad_channels}")
+        raw.info["bads"] = bad_channels
+        raw.interpolate_bads(reset_bads=True)
+        print("[PREPROCESSING] Bad channel interpolation complete")
+    else:
+        print("[PREPROCESSING] No bad channels to interpolate")
+    return raw
+
+
+{% if ica_enabled %}
+def apply_ica(raw):
+    """Apply ICA for artifact removal (eye blinks, muscle, cardiac).
+
+    ICA decomposes EEG into statistically independent components, allowing
+    identification and removal of non-neural sources while preserving brain
+    signals (Makeig et al., 1996; Delorme et al., 2007).
+
+    Parameters
+    ----------
+    raw : mne.io.Raw
+        Preprocessed EEG data.
+
+    Returns
+    -------
+    mne.io.Raw
+        ICA-cleaned data.
+    """
+    print(f"[PREPROCESSING] Running ICA ({ICA_METHOD}, {N_COMPONENTS} components)")
+    ica = mne.preprocessing.ICA(
+        n_components=N_COMPONENTS,
+        method=ICA_METHOD,
+        random_state=SEED,
+        max_iter="auto",
+    )
+    ica.fit(raw)
+
+    # Automatic artifact component detection
+    # EOG artifact detection
+    eog_indices = []
+    eog_chs = [ch for ch in raw.ch_names if "EOG" in ch.upper() or "VEOG" in ch.upper() or "HEOG" in ch.upper()]
+    if eog_chs:
+        eog_indices, eog_scores = ica.find_bads_eog(raw, ch_name=eog_chs[0])
+    else:
+        # Use frontal channels as EOG proxy (Fp1, Fp2)
+        frontal = [ch for ch in raw.ch_names if ch in ["Fp1", "Fp2", "AF3", "AF4"]]
+        if frontal:
+            eog_indices, eog_scores = ica.find_bads_eog(raw, ch_name=frontal[0])
+
+    # ECG artifact detection (cardiac field artifact)
+    ecg_indices = []
+    try:
+        ecg_indices, ecg_scores = ica.find_bads_ecg(raw, method="correlation")
+    except Exception:
+        pass
+
+    # Mark and remove artifact components
+    ica.exclude = list(set(eog_indices + ecg_indices))
+    print(f"[PREPROCESSING] ICA excluding {len(ica.exclude)} components: EOG={eog_indices}, ECG={ecg_indices}")
+
+    # REVIEW: Automatic ICA component rejection - inspect components manually if results seem off
+    raw = ica.apply(raw)
+    print("[PREPROCESSING] ICA artifact removal complete")
+    return raw
+{% endif %}
+
+
+def run_preprocessing():
+    """Execute the complete preprocessing pipeline."""
+    print(f"[PREPROCESSING] Starting preprocessing for: {DATASET_NAME}")
+
+    # Load quality report to get bad channels
+    quality_report = load_quality_report()
+    flat_channels = quality_report.get("flat_channels", [])
+
+    # Load data from previous stage output or original file
+    raw_path = os.path.join("outputs", "raw_eeg.fif")
+    if os.path.exists(raw_path):
+        raw = mne.io.read_raw_fif(raw_path, preload=True)
+    else:
+        print("[PREPROCESSING] Loading from original file path")
+        raw = mne.io.read_raw_fif(raw_path, preload=True)
+
+    original_sfreq = raw.info["sfreq"]
+    print(f"[PREPROCESSING] Original sampling rate: {original_sfreq} Hz")
+
+    # Step 1: Interpolate bad channels (before filtering)
+    raw = interpolate_bad_channels(raw, flat_channels)
+
+    # Step 2: Bandpass filter
+    raw = apply_bandpass_filter(raw)
+
+    # Step 3: Notch filter
+    raw = apply_notch_filter(raw)
+
+    # Step 4: Re-reference
+    raw = apply_reference(raw)
+
+    {% if ica_enabled %}
+    # Step 5: ICA artifact removal
+    raw = apply_ica(raw)
+    {% endif %}
+
+    {% if downsample_freq is defined and downsample_freq %}
+    # Step 6: Downsample
+    print(f"[PREPROCESSING] Downsampling from {raw.info['sfreq']} Hz to {DOWNSAMPLE_FREQ} Hz")
+    raw.resample(DOWNSAMPLE_FREQ)
+    print(f"[PREPROCESSING] Resampled to {raw.info['sfreq']} Hz")
+    {% endif %}
+
+    # Save preprocessed data
+    output_path = os.path.join("outputs", "preprocessed_eeg.fif")
+    raw.save(output_path, overwrite=True)
+    print(f"[PREPROCESSING] Preprocessed data saved to: {output_path}")
+
+    # Save preprocessing summary
+    summary = {
+        "dataset_name": DATASET_NAME,
+        "hp_freq": HP_FREQ,
+        "lp_freq": LP_FREQ,
+        "notch_freq": NOTCH_FREQ,
+        "reference_method": REFERENCE_METHOD,
+        "ica_enabled": ICA_ENABLED,
+        "interpolated_channels": flat_channels,
+        "original_sfreq": original_sfreq,
+        "final_sfreq": raw.info["sfreq"],
+        "n_channels": len(raw.ch_names),
+    }
+    summary_path = os.path.join("outputs", "preprocessing_summary.json")
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"[PREPROCESSING] Summary saved to: {summary_path}")
+
+    return raw
+
+
+if __name__ == "__main__":
+    result = run_preprocessing()

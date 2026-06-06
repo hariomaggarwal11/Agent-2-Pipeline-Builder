@@ -1,0 +1,305 @@
+"""
+EEG Feature Selection Stage
+=============================
+Dataset: {{ dataset_name }}
+Modality: EEG
+Purpose: Select the most informative features using {{ method }} and apply
+         normalization to reduce dimensionality and improve model performance
+         while retaining neurophysiologically meaningful features.
+
+Feature selection reduces the curse of dimensionality and removes redundant
+or noisy features that could degrade classifier performance.
+"""
+
+import os
+import json
+import numpy as np
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.feature_selection import mutual_info_classif, f_classif, SelectKBest
+
+# Neurophysiological rationale:
+# High-dimensional EEG feature spaces (channels x bands x connectivity)
+# contain redundant features due to volume conduction and correlated sources.
+# Feature selection identifies the most discriminative subset, improving
+# generalization and interpretability (Lotte et al., 2018 - A review of
+# classification algorithms for EEG-based brain-computer interfaces).
+
+SEED = 42
+np.random.seed(SEED)
+
+# Configuration
+DATASET_NAME = "{{ dataset_name }}"
+METHOD = "{{ method }}"  # mRMR, mutual_info, ANOVA, RFE, None
+TOP_K = {{ top_k }}  # Number of features to retain
+NORMALIZER = "{{ normalizer }}"  # standard, minmax, none
+
+os.makedirs("outputs", exist_ok=True)
+
+
+def load_features():
+    """Load extracted features from previous stage.
+
+    Returns
+    -------
+    tuple
+        (features, labels) numpy arrays.
+    """
+    print("[FEATURE_SELECTION] Loading features...")
+    features = np.load(os.path.join("outputs", "features.npy"))
+    labels = np.load(os.path.join("outputs", "feature_labels.npy"))
+    print(f"[FEATURE_SELECTION] Features shape: {features.shape}, Labels: {labels.shape}")
+    return features, labels
+
+
+def normalize_features(features):
+    """Apply feature normalization.
+
+    Normalization ensures features are on comparable scales, which is
+    critical for distance-based methods and gradient optimization
+    (Zimmer et al., 2012).
+
+    Parameters
+    ----------
+    features : np.ndarray
+        Raw features.
+
+    Returns
+    -------
+    tuple
+        (normalized_features, scaler)
+    """
+    print(f"[FEATURE_SELECTION] Normalizing with: {NORMALIZER}")
+    if NORMALIZER == "standard":
+        scaler = StandardScaler()
+        features_norm = scaler.fit_transform(features)
+    elif NORMALIZER == "minmax":
+        scaler = MinMaxScaler()
+        features_norm = scaler.fit_transform(features)
+    else:
+        scaler = None
+        features_norm = features
+
+    print("[FEATURE_SELECTION] Normalization complete")
+    return features_norm, scaler
+
+
+{% if method == "mRMR" %}
+def select_mrmr(features, labels, k):
+    """Minimum Redundancy Maximum Relevance (mRMR) feature selection.
+
+    mRMR selects features that are maximally relevant to the target while
+    being minimally redundant with each other (Peng et al., 2005).
+    This is particularly effective for EEG where nearby channels carry
+    correlated information due to volume conduction.
+
+    Parameters
+    ----------
+    features : np.ndarray
+        Feature matrix.
+    labels : np.ndarray
+        Target labels.
+    k : int
+        Number of features to select.
+
+    Returns
+    -------
+    np.ndarray
+        Indices of selected features.
+    """
+    print(f"[FEATURE_SELECTION] Running mRMR (selecting top {k} features)...")
+    n_features = features.shape[1]
+    k = min(k, n_features)
+
+    # Compute mutual information with target
+    mi_target = mutual_info_classif(features, labels, random_state=SEED)
+
+    selected = []
+    remaining = list(range(n_features))
+
+    # Select first feature with highest MI to target
+    first = np.argmax(mi_target)
+    selected.append(first)
+    remaining.remove(first)
+
+    # Iteratively select features
+    for _ in range(k - 1):
+        best_score = -np.inf
+        best_feat = None
+        for feat in remaining:
+            # Relevance: MI with target
+            relevance = mi_target[feat]
+            # Redundancy: average MI with already selected features
+            redundancy = np.mean([
+                np.abs(np.corrcoef(features[:, feat], features[:, s])[0, 1])
+                for s in selected
+            ])
+            # mRMR criterion
+            score = relevance - redundancy
+            if score > best_score:
+                best_score = score
+                best_feat = feat
+        if best_feat is not None:
+            selected.append(best_feat)
+            remaining.remove(best_feat)
+
+    print(f"[FEATURE_SELECTION] mRMR selected {len(selected)} features")
+    return np.array(selected)
+{% endif %}
+
+
+{% if method == "mutual_info" %}
+def select_mutual_info(features, labels, k):
+    """Mutual Information-based feature selection.
+
+    MI measures the statistical dependency between features and target,
+    capturing both linear and nonlinear relationships (Kraskov et al., 2004).
+
+    Parameters
+    ----------
+    features : np.ndarray
+        Feature matrix.
+    labels : np.ndarray
+        Target labels.
+    k : int
+        Number of features to select.
+
+    Returns
+    -------
+    np.ndarray
+        Indices of selected features.
+    """
+    print(f"[FEATURE_SELECTION] Running MI selection (top {k})...")
+    mi_scores = mutual_info_classif(features, labels, random_state=SEED)
+    top_indices = np.argsort(mi_scores)[::-1][:k]
+    print(f"[FEATURE_SELECTION] MI scores range: [{mi_scores.min():.4f}, {mi_scores.max():.4f}]")
+    return top_indices
+{% endif %}
+
+
+{% if method == "ANOVA" %}
+def select_anova(features, labels, k):
+    """ANOVA F-value feature selection.
+
+    ANOVA tests whether features have significantly different means across
+    classes. Effective for normally distributed features (Milligan, 1980).
+
+    Parameters
+    ----------
+    features : np.ndarray
+        Feature matrix.
+    labels : np.ndarray
+        Target labels.
+    k : int
+        Number of features to select.
+
+    Returns
+    -------
+    np.ndarray
+        Indices of selected features.
+    """
+    print(f"[FEATURE_SELECTION] Running ANOVA F-test (top {k})...")
+    selector = SelectKBest(score_func=f_classif, k=min(k, features.shape[1]))
+    selector.fit(features, labels)
+    top_indices = np.argsort(selector.scores_)[::-1][:k]
+    print(f"[FEATURE_SELECTION] ANOVA F-scores range: [{selector.scores_.min():.4f}, {selector.scores_.max():.4f}]")
+    return top_indices
+{% endif %}
+
+
+{% if method == "RFE" %}
+def select_rfe(features, labels, k):
+    """Recursive Feature Elimination using SVM.
+
+    RFE iteratively removes the least important features based on model
+    weights, leveraging the classifier itself for selection (Guyon et al., 2002).
+
+    Parameters
+    ----------
+    features : np.ndarray
+        Feature matrix.
+    labels : np.ndarray
+        Target labels.
+    k : int
+        Number of features to select.
+
+    Returns
+    -------
+    np.ndarray
+        Indices of selected features.
+    """
+    from sklearn.svm import LinearSVC
+    from sklearn.feature_selection import RFE
+    print(f"[FEATURE_SELECTION] Running RFE with SVM (top {k})...")
+    # REVIEW: RFE can be slow for large feature spaces, consider step > 1
+    estimator = LinearSVC(random_state=SEED, max_iter=5000)
+    selector = RFE(estimator, n_features_to_select=min(k, features.shape[1]), step=1)
+    selector.fit(features, labels)
+    top_indices = np.where(selector.support_)[0]
+    print(f"[FEATURE_SELECTION] RFE selected {len(top_indices)} features")
+    return top_indices
+{% endif %}
+
+
+def run_feature_selection():
+    """Execute the feature selection pipeline."""
+    print(f"[FEATURE_SELECTION] Starting for: {DATASET_NAME}")
+    print(f"[FEATURE_SELECTION] Method: {METHOD}, Top-K: {TOP_K}")
+
+    # Load features
+    features, labels = load_features()
+
+    # Normalize
+    features_norm, scaler = normalize_features(features)
+
+    # Select features
+    {% if method == "None" or method == "none" %}
+    print("[FEATURE_SELECTION] No feature selection applied (using all features)")
+    selected_indices = np.arange(features_norm.shape[1])
+    selected_features = features_norm
+    {% elif method == "mRMR" %}
+    selected_indices = select_mrmr(features_norm, labels, TOP_K)
+    selected_features = features_norm[:, selected_indices]
+    {% elif method == "mutual_info" %}
+    selected_indices = select_mutual_info(features_norm, labels, TOP_K)
+    selected_features = features_norm[:, selected_indices]
+    {% elif method == "ANOVA" %}
+    selected_indices = select_anova(features_norm, labels, TOP_K)
+    selected_features = features_norm[:, selected_indices]
+    {% elif method == "RFE" %}
+    selected_indices = select_rfe(features_norm, labels, TOP_K)
+    selected_features = features_norm[:, selected_indices]
+    {% else %}
+    print("[FEATURE_SELECTION] Unknown method, using all features")
+    selected_indices = np.arange(features_norm.shape[1])
+    selected_features = features_norm
+    {% endif %}
+
+    print(f"[FEATURE_SELECTION] Selected features: {selected_features.shape}")
+
+    # Save selected features
+    output_path = os.path.join("outputs", "selected_features.npy")
+    labels_path = os.path.join("outputs", "selected_labels.npy")
+    np.save(output_path, selected_features)
+    np.save(labels_path, labels)
+    print(f"[FEATURE_SELECTION] Saved: {output_path}")
+
+    # Save selection summary
+    summary = {
+        "dataset_name": DATASET_NAME,
+        "method": METHOD,
+        "original_n_features": features.shape[1],
+        "selected_n_features": selected_features.shape[1],
+        "top_k": TOP_K,
+        "normalizer": NORMALIZER,
+        "selected_indices": selected_indices.tolist(),
+    }
+    summary_path = os.path.join("outputs", "feature_selection_summary.json")
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"[FEATURE_SELECTION] Summary saved: {summary_path}")
+
+    return selected_features, labels
+
+
+if __name__ == "__main__":
+    features, labels = run_feature_selection()

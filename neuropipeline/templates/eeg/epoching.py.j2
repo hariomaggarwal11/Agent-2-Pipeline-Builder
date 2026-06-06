@@ -1,0 +1,291 @@
+"""
+EEG Epoching Stage
+===================
+Dataset: {{ dataset_name }}
+Modality: EEG
+Purpose: Segment continuous EEG into analysis-appropriate epochs using
+         {{ epoch_method }}-based epoching, apply rejection criteria,
+         and prepare labeled data for feature extraction and classification.
+
+Epoching converts continuous data into discrete trials that can be independently
+analyzed, labeled, and split across subjects for cross-validation.
+"""
+
+import os
+import json
+import numpy as np
+import mne
+
+# Neurophysiological rationale:
+# Epoching segments continuous EEG into time-locked windows that capture
+# task-relevant neural dynamics. The choice of epoch method depends on the
+# experimental paradigm:
+# - Event-based: time-locked to stimulus onset (ERPs, Luck 2014)
+# - Fixed-length: sliding windows for resting-state or continuous tasks
+# - Trial-based: aligned to experimental trial structure (emotion/BCI)
+# (Cohen, 2014 - Analyzing Neural Time Series Data)
+
+SEED = 42
+np.random.seed(SEED)
+
+# Configuration
+DATASET_NAME = "{{ dataset_name }}"
+EPOCH_METHOD = "{{ epoch_method }}"  # event-based, fixed-length, trial-based
+{% if epoch_method == "fixed-length" %}
+WINDOW_SIZE = {{ window_size }}  # Window duration in seconds
+STEP_SIZE = {{ step_size }}  # Step size (overlap = window_size - step_size)
+{% endif %}
+{% if epoch_method == "event-based" %}
+TMIN = {{ tmin }}  # Epoch start relative to event (seconds)
+TMAX = {{ tmax }}  # Epoch end relative to event (seconds)
+{% endif %}
+{% if epoch_method == "trial-based" %}
+TRIAL_DURATION = {{ trial_duration }}  # Duration of each trial in seconds
+{% endif %}
+REJECT_THRESHOLD = {{ reject_threshold }}  # Peak-to-peak rejection threshold (uV)
+{% if label_source is defined %}
+LABEL_SOURCE = "{{ label_source }}"
+{% endif %}
+{% if binarize is defined %}
+BINARIZE = {{ binarize }}
+{% endif %}
+{% if binary_threshold is defined %}
+BINARY_THRESHOLD = {{ binary_threshold }}
+{% endif %}
+
+os.makedirs("outputs", exist_ok=True)
+
+
+def load_preprocessed_data():
+    """Load preprocessed EEG data from previous stage.
+
+    Returns
+    -------
+    mne.io.Raw
+        Preprocessed continuous EEG data.
+    """
+    print("[EPOCHING] Loading preprocessed data...")
+    fif_path = os.path.join("outputs", "preprocessed_eeg.fif")
+    raw = mne.io.read_raw_fif(fif_path, preload=True)
+    print(f"[EPOCHING] Loaded: {raw.info['nchan']} channels, {raw.info['sfreq']} Hz")
+    return raw
+
+
+{% if epoch_method == "event-based" %}
+def create_event_epochs(raw):
+    """Create epochs time-locked to stimulus events.
+
+    Event-related analysis requires precise time-locking to stimulus
+    or response markers embedded in the EEG recording. This preserves
+    the temporal structure of event-related potentials (ERPs).
+
+    Parameters
+    ----------
+    raw : mne.io.Raw
+        Preprocessed data.
+
+    Returns
+    -------
+    mne.Epochs
+        Event-locked epochs.
+    """
+    print("[EPOCHING] Creating event-based epochs")
+    print(f"[EPOCHING] Time window: {TMIN} to {TMAX} seconds")
+
+    # Find events from annotations or STIM channels
+    events = mne.find_events(raw, stim_channel="auto", min_duration=0.001)
+    if len(events) == 0:
+        # Try annotations
+        events, event_id = mne.events_from_annotations(raw)
+    else:
+        event_id = None
+
+    print(f"[EPOCHING] Found {len(events)} events")
+
+    # Create epochs
+    reject_dict = {"eeg": REJECT_THRESHOLD * 1e-6}  # Convert uV to V
+    epochs = mne.Epochs(
+        raw,
+        events,
+        event_id=event_id,
+        tmin=TMIN,
+        tmax=TMAX,
+        baseline=(TMIN, 0),
+        reject=reject_dict,
+        preload=True,
+    )
+    print(f"[EPOCHING] Epochs created: {len(epochs)} (rejected: {len(events) - len(epochs)})")
+    return epochs
+{% endif %}
+
+{% if epoch_method == "fixed-length" %}
+def create_fixed_epochs(raw):
+    """Create fixed-length overlapping epochs.
+
+    Fixed-length epoching is appropriate for resting-state or continuous
+    paradigms where no external events define trial boundaries.
+    Overlapping windows increase the number of training samples.
+
+    Parameters
+    ----------
+    raw : mne.io.Raw
+        Preprocessed data.
+
+    Returns
+    -------
+    mne.Epochs
+        Fixed-length epochs.
+    """
+    print("[EPOCHING] Creating fixed-length epochs")
+    print(f"[EPOCHING] Window: {WINDOW_SIZE}s, Step: {STEP_SIZE}s")
+
+    # REVIEW: Overlap ratio affects feature correlation between consecutive epochs
+    epochs = mne.make_fixed_length_epochs(
+        raw,
+        duration=WINDOW_SIZE,
+        overlap=WINDOW_SIZE - STEP_SIZE,
+        preload=True,
+    )
+
+    # Apply rejection
+    reject_dict = {"eeg": REJECT_THRESHOLD * 1e-6}
+    epochs.drop_bad(reject=reject_dict)
+    print(f"[EPOCHING] Fixed epochs created: {len(epochs)}")
+    return epochs
+{% endif %}
+
+{% if epoch_method == "trial-based" %}
+def create_trial_epochs(raw):
+    """Create epochs based on experimental trial structure.
+
+    Trial-based epoching uses metadata or annotations to define
+    trial boundaries, common in emotion recognition paradigms where
+    each trial corresponds to a stimulus presentation period
+    (e.g., video watching in DEAP/DREAMER).
+
+    Parameters
+    ----------
+    raw : mne.io.Raw
+        Preprocessed data.
+
+    Returns
+    -------
+    mne.Epochs
+        Trial-based epochs.
+    """
+    print("[EPOCHING] Creating trial-based epochs")
+    print(f"[EPOCHING] Trial duration: {TRIAL_DURATION}s")
+
+    # Create events at trial boundaries
+    sfreq = raw.info["sfreq"]
+    trial_samples = int(TRIAL_DURATION * sfreq)
+    n_trials = int(raw.n_times / trial_samples)
+
+    events = np.array([
+        [i * trial_samples, 0, 1] for i in range(n_trials)
+    ])
+    print(f"[EPOCHING] Trial count: {n_trials}")
+
+    # Create epochs
+    reject_dict = {"eeg": REJECT_THRESHOLD * 1e-6}
+    epochs = mne.Epochs(
+        raw,
+        events,
+        tmin=0,
+        tmax=TRIAL_DURATION - 1.0 / sfreq,
+        baseline=None,
+        reject=reject_dict,
+        preload=True,
+    )
+    print(f"[EPOCHING] Trial epochs created: {len(epochs)}")
+    return epochs
+{% endif %}
+
+
+def apply_labels(epochs, labels=None):
+    """Apply labels to epochs for supervised learning.
+
+    Parameters
+    ----------
+    epochs : mne.Epochs
+        Epoched data.
+    labels : array-like, optional
+        Labels corresponding to each epoch.
+
+    Returns
+    -------
+    tuple
+        (epoch_data, labels) as numpy arrays.
+    """
+    print("[EPOCHING] Applying labels to epochs...")
+    data = epochs.get_data()  # shape: (n_epochs, n_channels, n_times)
+
+    if labels is None:
+        # Use event IDs as labels
+        labels = epochs.events[:, 2]
+
+    # Ensure labels match epochs
+    min_len = min(len(data), len(labels))
+    data = data[:min_len]
+    labels = np.array(labels[:min_len])
+
+    {% if binarize is defined and binarize %}
+    # Binarize labels (e.g., arousal: low/high split at threshold)
+    print(f"[EPOCHING] Binarizing labels with threshold: {BINARY_THRESHOLD}")
+    labels = (labels >= BINARY_THRESHOLD).astype(int)
+    {% endif %}
+
+    print(f"[EPOCHING] Data shape: {data.shape}, Labels shape: {labels.shape}")
+    print(f"[EPOCHING] Label distribution: {dict(zip(*np.unique(labels, return_counts=True)))}")
+    return data, labels
+
+
+def run_epoching():
+    """Execute the epoching pipeline."""
+    print(f"[EPOCHING] Starting epoching for: {DATASET_NAME}")
+    print(f"[EPOCHING] Method: {EPOCH_METHOD}")
+
+    # Load preprocessed data
+    raw = load_preprocessed_data()
+
+    # Create epochs based on method
+    {% if epoch_method == "event-based" %}
+    epochs = create_event_epochs(raw)
+    {% elif epoch_method == "fixed-length" %}
+    epochs = create_fixed_epochs(raw)
+    {% elif epoch_method == "trial-based" %}
+    epochs = create_trial_epochs(raw)
+    {% endif %}
+
+    # Apply labels
+    data, labels = apply_labels(epochs)
+
+    # Save epoched data
+    output_data_path = os.path.join("outputs", "epochs_data.npy")
+    output_labels_path = os.path.join("outputs", "epochs_labels.npy")
+    np.save(output_data_path, data)
+    np.save(output_labels_path, labels)
+    print(f"[EPOCHING] Data saved: {output_data_path}")
+    print(f"[EPOCHING] Labels saved: {output_labels_path}")
+
+    # Save epoching summary
+    summary = {
+        "dataset_name": DATASET_NAME,
+        "epoch_method": EPOCH_METHOD,
+        "n_epochs": len(data),
+        "n_channels": data.shape[1],
+        "n_timepoints": data.shape[2],
+        "n_classes": len(np.unique(labels)),
+        "label_distribution": {str(k): int(v) for k, v in zip(*np.unique(labels, return_counts=True))},
+        "reject_threshold_uv": REJECT_THRESHOLD,
+    }
+    summary_path = os.path.join("outputs", "epoching_summary.json")
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"[EPOCHING] Summary saved: {summary_path}")
+
+    return data, labels
+
+
+if __name__ == "__main__":
+    data, labels = run_epoching()
