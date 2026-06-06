@@ -2,7 +2,7 @@
   "id": "FEAT-004",
   "type": "feat",
   "description": "Tests and final integration - pytest test suite covering agent1_bridge, pipeline_planner, EEG stages, ECG stages, and code_generator. Plus final integration ensuring all modules work together.",
-  "status": "pending",
+  "status": "completed",
   "steps": [
     "Create neuropipeline/tests/__init__.py",
     "Create neuropipeline/tests/conftest.py - shared fixtures: sample_agent1_eeg_report (DREAMER-like JSON dict with modality=EEG, known_dataset.name=DREAMER, quality_score.score=85, metadata with 14 channels, 128 Hz, artifacts dict), sample_agent1_ecg_report (MIT-BIH-like JSON with modality=ECG, 2 leads, 360 Hz), sample_pipeline_config (output of plan_pipeline for DREAMER)",
@@ -25,5 +25,5 @@
     "cd /projects/sandbox/Agent-2-Pipeline-Builder && python -m pytest neuropipeline/tests/ -v --tb=short"
   ],
   "blocked_reason": null,
-  "findings": ""
+  "findings": "All 234 tests pass. Anthropic API is mocked using sys.modules patching since the import happens inside the function. conftest.py uses Number of Leads for ECG fixture to match the code_generator/pipeline_planner logic."
 }
