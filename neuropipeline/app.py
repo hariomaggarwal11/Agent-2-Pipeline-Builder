@@ -135,7 +135,20 @@ def _render_sidebar():
 
         # Navigation
         if st.session_state.get("pipeline_config"):
-            if st.button("Back to Landing", use_container_width=True):
+            # Show pipeline info when on canvas
+            pipeline_config = st.session_state["pipeline_config"]
+            modality = pipeline_config.get("modality", "eeg").upper()
+            task = st.session_state.get("task_selection", "Unknown")
+            model = st.session_state.get("model_family", "auto")
+
+            st.markdown("#### Pipeline Info")
+            st.markdown(f"**Modality:** {modality}")
+            st.markdown(f"**Task:** {task}")
+            st.markdown(f"**Model:** {model}")
+
+            st.markdown("---")
+
+            if st.button("\u2190 Back to Landing", use_container_width=True):
                 st.session_state["current_screen"] = "landing"
                 st.rerun()
 

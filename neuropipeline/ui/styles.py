@@ -41,10 +41,10 @@ def get_custom_css():
     --code-border:           #21262d;
 }
 
-/* Hide Streamlit branding */
+/* Hide Streamlit branding but keep sidebar toggle visible */
 #MainMenu {visibility: hidden;}
 footer {visibility: hidden;}
-header {visibility: hidden;}
+/* Note: header is NOT hidden so sidebar toggle remains accessible */
 
 /* Main app styling */
 .stApp {
